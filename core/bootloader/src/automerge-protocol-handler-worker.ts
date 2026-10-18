@@ -83,6 +83,12 @@ function getRepo(): Promise<Repo> {
   return repoPromise;
 }
 
+// The worker signs as the same Subduction peer as the tabs (see signer.ts), and
+// the server keeps ephemeral subscriptions per peer: it relays the tabs'
+// presence to the worker's connection too, and an unsubscribe from the worker
+// unsubscribes the tabs. So the worker's repo stays out of ephemeral messaging.
+// Otherwise those messages set up the tabs' documents here, and evicting them
+// (see evictLoaded) cut the tabs off from presence on them.
 async function buildRepo(): Promise<Repo> {
   log("fetching wasm");
   await Promise.all([
@@ -110,6 +116,7 @@ async function buildPlainRepo(): Promise<Repo> {
     subductionWebsocketEndpoints: [syncServer.url],
     headsChannel: `${storagePrefix}-heads`,
     enableRemoteHeadsGossiping: true,
+    subductionEphemeral: false,
   });
 }
 
@@ -123,9 +130,10 @@ async function buildKeyhiveRepo(
     // ARK injects an `idFactory` deriving document ids from keyhive. A site
     // can opt out of it with `keyhive: { useIdFactory: false }`.
     createRepo: ({ idFactory, ...config }) =>
-      new Repo(
-        syncServer.useIdFactory === false ? config : { ...config, idFactory }
-      ),
+      new Repo({
+        ...(syncServer.useIdFactory === false ? config : { ...config, idFactory }),
+        subductionEphemeral: false,
+      }),
     storage: new IndexedDBStorageAdapter(keyhiveStorageName),
     peerIdSuffix:
       `${storagePrefix}-resolver` + Math.random().toString(36).slice(2),
