@@ -1,5 +1,6 @@
 import type { Plugin } from "vite";
 import wasm from "vite-plugin-wasm";
+import { patches } from "./patches-plugin.js";
 import { DEFAULT_STORAGE_PREFIX } from "@inkandswitch/patchwork-bootloader/storage";
 import { DEFAULT_TITLE } from "../site-kit/options.js";
 import type { PatchworkVitePluginOptions } from "./patchwork-plugin.js";
@@ -9,6 +10,11 @@ import {
 } from "../site-kit/sync-servers.js";
 
 const CORS_HEADERS = { "Access-Control-Allow-Origin": "*" };
+
+// One id per build process. buildDefines runs several times in a build (the
+// page's define, dep pre-bundling, each dev worker context) and the page and
+// the shared worker have to agree on it, so it can't be computed per call.
+const DEFAULT_BUILD_ID = Date.now();
 
 /**
  * The build-time constants both the page bundle and the workers are compiled
@@ -29,20 +35,19 @@ export function buildDefines(
     __STORAGE_PREFIX__: JSON.stringify(
       options.storagePrefix ?? DEFAULT_STORAGE_PREFIX
     ),
+    __BUILD_ID__: JSON.stringify(options.buildId ?? DEFAULT_BUILD_ID),
   };
 }
 
 /**
- * Owns envPrefix, define (__SITE_TITLE__/__STORAGE_PREFIX__/sync-server
- * configuration),
+ * Owns envPrefix, define (__SITE_TITLE__/__STORAGE_PREFIX__/__BUILD_ID__/
+ * sync-server configuration),
  * server/preview CORS defaults, worker format + the wasm plugin, and build
  * defaults (firefox150 target, unminified, sourcemapped) — everything a site
  * used to hand-write in its own vite.config.ts. Each is switched off
  * individually via the matching `false` option.
  */
-export function config(
-  options: PatchworkVitePluginOptions = {}
-): Plugin {
+export function config(options: PatchworkVitePluginOptions = {}): Plugin {
   return {
     name: "@patchwork/config",
     config() {
@@ -70,6 +75,7 @@ export function config(
             : {
                 port: process.env.PORT ? +process.env.PORT : 5173,
                 headers: CORS_HEADERS,
+                cors: false,
                 ...options.preview,
               },
         worker:
@@ -77,7 +83,7 @@ export function config(
             ? undefined
             : {
                 format: options.worker?.format ?? "es",
-                plugins: () => [wasm()],
+                plugins: () => [wasm(), patches({ complete: false })],
               },
         build: {
           target: "firefox150",
@@ -87,11 +93,11 @@ export function config(
         },
       };
     },
-    // The shared automerge-worker's chunk imports bypass the page's service
-    // worker, so offline boot needs the browser's HTTP cache to serve them
-    // without revalidating. Content hashes make that safe; a new build gets
-    // new URLs. Production gets this from the generated _headers file — vite
-    // preview doesn't read that, so mirror it here.
+    // The shared automerge-protocol-handler-worker's chunk imports bypass the
+    // page's service worker, so offline boot needs the browser's HTTP cache to
+    // serve them without revalidating. Content hashes make that safe; a new
+    // build gets new URLs. Production gets this from the generated _headers
+    // file — vite preview doesn't read that, so mirror it here.
     configurePreviewServer(server) {
       if (
         options.netlify === false ||
@@ -101,10 +107,7 @@ export function config(
       }
       server.middlewares.use((req, res, next) => {
         if (req.url?.startsWith("/assets/")) {
-          res.setHeader(
-            "Cache-Control",
-            "public, max-age=31536000, immutable"
-          );
+          res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
         }
         next();
       });

@@ -1,22 +1,18 @@
+import { initializeWasm, Repo } from "@automerge/vanillajs/slim";
+import { IndexedDBStorageAdapter } from "@automerge/automerge-repo-storage-indexeddb";
+import { loadOrCreateSigner } from "@inkandswitch/patchwork-bootloader/signer";
 import {
-  initializeWasm,
-  MessageChannelNetworkAdapter,
-  Repo,
-  type AutomergeUrl,
-} from "@automerge/vanillajs/slim";
-import { IndexedDBWorkerStorageAdapter } from "@automerge/automerge-repo-storage-indexeddb/IndexedDBWorkerStorageAdapter";
+  getSyncRemote,
+  relayKeyhive,
+} from "@inkandswitch/patchwork-bootloader";
 import * as AutomergeRepo from "@automerge/automerge-repo/slim";
-import {
-  initKeyhiveWasm,
-  initializeAutomergeRepoKeyhiveWithRepo,
-  type AutomergeRepoKeyhive,
-  type SyncServerSelection,
+import type {
+  AutomergeRepoKeyhive,
+  SyncServerSelection,
 } from "@automerge/automerge-repo-keyhive";
 // eslint-disable-next-line
-// @ts-ignore — initSync is a wasm-bindgen runtime helper not in the .d.ts
-import { initSync as initSubductionSync } from "@automerge/automerge-subduction/slim";
-import { MemorySigner } from "@automerge/automerge-subduction/slim";
-import setupServiceWorker from "@inkandswitch/patchwork-bootloader";
+// @ts-ignore — the default init is a wasm-bindgen runtime helper not in the .d.ts
+import initSubduction from "@automerge/automerge-subduction/slim";
 import {
   keyhiveStorageName,
   storagePrefix,
@@ -29,6 +25,7 @@ const log = debug("patchwork:setup:repo");
 declare const __SYNC_SERVER__: {
   url: string;
   keyhive?: SyncServerSelection;
+  useIdFactory?: boolean;
 };
 const syncServer =
   typeof __SYNC_SERVER__ !== "undefined"
@@ -41,40 +38,62 @@ const syncServer =
 let wasmReady: Promise<void> | undefined;
 export function initWasm(): Promise<void> {
   if (!wasmReady) {
-    wasmReady = (async () => {
-      const [automergeWasm, subductionWasm] = await Promise.all([
-        fetch("/automerge.wasm").then((r) => r.bytes()),
-        fetch("/subduction.wasm").then((r) => r.bytes()),
-      ]);
-      await initializeWasm(automergeWasm);
-      initSubductionSync(subductionWasm);
-    })();
+    wasmReady = Promise.all([
+      initializeWasm(new Request("/automerge.wasm")),
+      initSubduction(new Request("/subduction.wasm")),
+    ]).then(() => undefined);
   }
   return wasmReady;
 }
 
-export async function createRepo(
-  workerAdapter: MessageChannelNetworkAdapter
-): Promise<{
+// A tab tells the sync node about an edit only once it has saved it, so the
+// save throttle (automerge-repo's default is 100ms) is on the path from an
+// edit to the other tabs and the server.
+const SAVE_THROTTLE_MS = 20;
+
+export type TabRepo = {
   repo: Repo;
   hive?: AutomergeRepoKeyhive;
   signerIdentity?: SignerIdentity;
-}> {
+};
+
+/**
+ * The tab's own Repo: this origin's IndexedDB, opened on this thread, and the
+ * storage channel to every other Repo on the origin. It has no connection of
+ * its own; it syncs through the sync node in the automerge worker, which holds
+ * the origin's one socket to the sync server. Every Repo on the origin signs
+ * as the same identity.
+ */
+export async function createRepo(): Promise<TabRepo> {
   if (syncServer.keyhive) {
     log("setting up keyhive");
+    const { initKeyhiveWasm, initializeAutomergeRepoKeyhive } =
+      await import("@automerge/automerge-repo-keyhive");
     initKeyhiveWasm();
-    const { hive, repo } = await initializeAutomergeRepoKeyhiveWithRepo({
-      createRepo: (repoConfig) => new Repo(repoConfig),
-      storage: new IndexedDBWorkerStorageAdapter(keyhiveStorageName),
+    const remote = getSyncRemote();
+    const { hive, repo } = await initializeAutomergeRepoKeyhive({
+      // ARK injects an `idFactory` deriving document ids from keyhive. A site
+      // can opt out of it with `keyhive: { useIdFactory: false }`.
+      createRepo: ({ idFactory, ...repoConfig }) =>
+        relayKeyhive(
+          new Repo(
+            syncServer.useIdFactory === false
+              ? repoConfig
+              : { ...repoConfig, idFactory }
+          ),
+          remote
+        ),
+      storage: new IndexedDBStorageAdapter(keyhiveStorageName),
       peerIdSuffix: storagePrefix + Math.random().toString(36).slice(2),
-      networkAdapter: workerAdapter,
       automaticArchiveIngestion: true,
       cachingMode: "periodic",
-      onlyShareWithHardcodedServerPeerId: false,
       // ARK selects the relay via `syncServer`, defaulting to "subduction".
       syncServer: syncServer.keyhive,
       repo: {
-        storage: new IndexedDBWorkerStorageAdapter(),
+        storage: new IndexedDBStorageAdapter(),
+        subductionRemote: remote,
+        subductionSaveThrottle: SAVE_THROTTLE_MS,
+        headsChannel: `${storagePrefix}-heads`,
         enableRemoteHeadsGossiping: true,
       },
     });
@@ -82,20 +101,20 @@ export async function createRepo(
     return { repo, hive };
   }
 
-  // An explicit signer, rather than the Repo's internal default, so the tab's
-  // identity can be exposed on window.patchwork. The tab never connects via
-  // Subduction, so this id never goes on the wire.
-  const signer = new MemorySigner();
+  // The signer is explicit rather than the Repo's internal default so that
+  // every tab on this origin signs as the same peer, and so the identity the
+  // tab presents to the server can be shown on window.patchwork.
+  const storage = new IndexedDBStorageAdapter();
+  const signer = await loadOrCreateSigner(storage);
   const repo = new Repo({
-    network: [workerAdapter],
-    storage: new IndexedDBWorkerStorageAdapter(),
     signer,
-    async sharePolicy(peerId) {
-      return peerId.includes("automerge-worker");
-    },
-    enableRemoteHeadsGossiping: true,
+    storage,
     peerId:
       `${storagePrefix}-tab-${crypto.randomUUID()}` as AutomergeRepo.PeerId,
+    subductionRemote: getSyncRemote(),
+    subductionSaveThrottle: SAVE_THROTTLE_MS,
+    headsChannel: `${storagePrefix}-heads`,
+    enableRemoteHeadsGossiping: true,
   });
   const signerIdentity = {
     peerId: signer.peerId().toString(),
@@ -107,47 +126,4 @@ export async function createRepo(
   };
   log("repo created, tab subduction identity:", signerIdentity);
   return { repo, signerIdentity };
-}
-
-/**
- * Resolve with the first repo port the worker delivers, calling `onRenewed` for
- * every later one.
- *
- * subscribeToRepoChannel is deliberately not awaited: it resolves only after
- * the boot channel's port-ready handshake, which can take its full 30s timeout
- * against a stranded worker connection. Boot blocks on the first *delivered*
- * port instead — if the boot channel stalls, worker recovery hands the listener
- * a good port long before that timeout.
- */
-export function firstRepoPort(
-  sw: Awaited<ReturnType<typeof setupServiceWorker>>,
-  onRenewed: (port: MessagePort) => void
-): Promise<MessagePort> {
-  return new Promise<MessagePort>((resolve) => {
-    let seen = false;
-    void sw.subscribeToRepoChannel((port) => {
-      if (seen) return onRenewed(port);
-      seen = true;
-      resolve(port);
-    });
-  });
-}
-
-/** Drop the adapter sitting on the dead worker port, leaving `keep` in place. */
-export function removeAdapterFor(
-  repo: Repo,
-  stale: MessageChannelNetworkAdapter,
-  keep: unknown
-): void {
-  for (const adapter of [...repo.networkSubsystem.adapters]) {
-    if (adapter === keep) continue;
-    // The keyhive wrapper keeps the wrapped adapter on `.networkAdapter`.
-    const base = (adapter as any).networkAdapter ?? adapter;
-    if (base !== stale) continue;
-    try {
-      repo.networkSubsystem.removeNetworkAdapter(adapter as any);
-    } catch (err) {
-      console.error("failed to remove stale worker network adapter", err);
-    }
-  }
 }

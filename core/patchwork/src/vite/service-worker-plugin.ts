@@ -19,8 +19,9 @@ export const workers = [
     fileName: "service-worker.js",
   },
   {
-    specifier: "@inkandswitch/patchwork-bootloader/automerge-worker",
-    fileName: "automerge-worker.js",
+    specifier:
+      "@inkandswitch/patchwork-bootloader/automerge-protocol-handler-worker",
+    fileName: "automerge-protocol-handler-worker.js",
   },
   {
     specifier: "@inkandswitch/patchwork-bootloader/module-loader-worker",
@@ -35,6 +36,16 @@ export function serviceworker(): Plugin {
   return {
     name: "@patchwork/service-worker",
     enforce: "pre",
+    config() {
+      return {
+        build: {
+          modulePreload: {
+            resolveDependencies: (_url, deps, { hostId }) =>
+              workers.some(({ fileName }) => fileName === hostId) ? [] : deps,
+          },
+        },
+      };
+    },
     configResolved(config) {
       serve = config.command === "serve";
     },

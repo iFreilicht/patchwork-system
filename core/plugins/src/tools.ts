@@ -1,4 +1,8 @@
-import type { AutomergeUrl, DocHandle, Repo } from "@automerge/automerge-repo";
+import type {
+  AutomergeUrl,
+  DocHandle,
+  Repo,
+} from "@automerge/automerge-repo/slim";
 import type {
   LoadablePlugin,
   LoadedPlugin,
@@ -10,10 +14,7 @@ import {
 } from "@inkandswitch/patchwork-filesystem";
 import { getRegistry } from "./registry/index.js";
 
-import type { initializeAutomergeRepoKeyhive } from "@automerge/automerge-repo-keyhive";
-type AutomergeRepoKeyhive = Awaited<
-  ReturnType<typeof initializeAutomergeRepoKeyhive>
->;
+import type { AutomergeRepoKeyhiveBase as AutomergeRepoKeyhive } from "@automerge/automerge-repo-keyhive";
 
 export type ToolImplementation<T = unknown> = ToolRender<T>;
 

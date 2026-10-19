@@ -5,7 +5,7 @@
     "url": "git+https://github.com/inkandswitch/patchwork-system.git",
     "directory": "core/elements"
   },
-  "version": "6.0.1",
+  "version": "6.0.3",
   "author": "Ink & Switch",
   "type": "module",
   "description": "",
@@ -48,8 +48,10 @@
     "test": "vitest run"
   },
   "devDependencies": {
+    "@automerge/automerge": "catalog:",
     "@automerge/automerge-repo": "catalog:",
     "@automerge/automerge-repo-keyhive": "catalog:",
+    "@automerge/automerge-subduction": "catalog:",
     "@inkandswitch/patchwork-filesystem": "workspace:^",
     "@inkandswitch/patchwork-plugins": "workspace:^",
     "@inkandswitch/patchwork-providers": "workspace:^",

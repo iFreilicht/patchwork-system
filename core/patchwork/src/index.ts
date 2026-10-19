@@ -1,8 +1,9 @@
 /**
  * One import for a Patchwork site.
  *
- * `setup(options)` constructs the Repo, wires up the automerge-worker port,
- * loads plugins via the ModuleWatcher, resolves the user's account document,
+ * `setup(options)` constructs the Repo, wires up the
+ * automerge-protocol-handler-worker port, loads plugins via the
+ * ModuleWatcher, resolves the user's account document,
  * installs the router, and resolves with the site's runtime API — `repo`,
  * `create`, `open`, `find`, `packages`, `plugins`, `sw` — which is what a
  * site assigns to `window.patchwork`.
@@ -15,19 +16,23 @@
  * Pulls in DOM- and plugin-layer dependencies, so it is for a browser site's
  * `main.ts` only. Non-UI consumers should import
  * `@inkandswitch/patchwork-bootloader` directly, which does SW registration
- * and the automerge-worker handoff and nothing else.
+ * and the automerge-protocol-handler-worker handoff and nothing else.
  */
 import {
   type AutomergeUrl,
   type DocHandle,
-  MessageChannelNetworkAdapter,
+  type DocumentId,
+  type StorageId,
   Repo,
 } from "@automerge/vanillajs/slim";
 import * as Automerge from "@automerge/automerge/slim";
 import * as AutomergeRepo from "@automerge/automerge-repo/slim";
-import type { AutomergeRepoKeyhive } from "@automerge/automerge-repo-keyhive";
+import type { AutomergeRepoKeyhiveBase as AutomergeRepoKeyhive } from "@automerge/automerge-repo-keyhive";
 
-import { ModuleWatcher } from "@inkandswitch/patchwork-filesystem";
+import {
+  ModuleWatcher,
+  trackPackagesViaServiceWorker,
+} from "@inkandswitch/patchwork-filesystem";
 import { importAutomergePackageViaWorker } from "@inkandswitch/patchwork-bootloader/module-loader";
 import { registerPatchworkViewElement } from "@inkandswitch/patchwork-elements";
 import { registerRepoProviderElement } from "@inkandswitch/patchwork-providers";
@@ -43,7 +48,7 @@ import {
 } from "@inkandswitch/patchwork-plugins";
 import * as plugins from "@inkandswitch/patchwork-plugins";
 import setupServiceWorker, {
-  lifecycleLog,
+  watchDocument,
 } from "@inkandswitch/patchwork-bootloader";
 import debug from "debug";
 
@@ -52,13 +57,9 @@ import type {
   Patchwork,
   PatchworkOptions,
   SignerIdentity,
+  SyncStateDocMessage,
 } from "./types.js";
-import {
-  createRepo,
-  firstRepoPort,
-  initWasm,
-  removeAdapterFor,
-} from "./repo.js";
+import { createRepo, initWasm } from "./repo.js";
 import { createRouter, type Router } from "./router.js";
 import { createDefaultAccount } from "./createAccount.js";
 
@@ -70,8 +71,8 @@ declare global {
   interface Window {
     patchwork: Patchwork;
     repo: Repo;
-    Automerge: typeof import("@automerge/automerge");
-    AutomergeRepo: typeof import("@automerge/automerge-repo");
+    Automerge: typeof import("@automerge/automerge/slim");
+    AutomergeRepo: typeof import("@automerge/automerge-repo/slim");
     hive?: AutomergeRepoKeyhive;
   }
 }
@@ -97,9 +98,7 @@ export function setup(options: PatchworkOptions = {}): Promise<Patchwork> {
     timer = setTimeout(
       () =>
         reject(
-          new Error(
-            `patchwork.setup: boot did not finish within ${timeout}ms`
-          )
+          new Error(`patchwork.setup: boot did not finish within ${timeout}ms`)
         ),
       timeout
     );
@@ -121,7 +120,6 @@ async function doSetup(options: PatchworkOptions): Promise<Patchwork> {
   const routing = options.routing ?? "hash";
 
   log("booting", options);
-  installLifecycleLogging();
 
   if (!options.repo) await initWasm();
 
@@ -132,55 +130,24 @@ async function doSetup(options: PatchworkOptions): Promise<Patchwork> {
   let hive: AutomergeRepoKeyhive | undefined;
   let repo: Repo;
   let signerIdentity: SignerIdentity | undefined;
-  // Called with a fresh port when the automerge worker dies and is recreated.
-  // Assigned once the repo exists.
-  let onWorkerPortRenewed: ((port: MessagePort) => void) | undefined;
 
   if (options.repo) {
     log("using provided Repo");
     repo = options.repo;
     hive = options.hive;
   } else {
-    const workerPort = await firstRepoPort(sw, (port) => {
-      if (onWorkerPortRenewed) onWorkerPortRenewed(port);
-      else {
-        console.warn(
-          "automerge worker port renewed before the repo existed; dropping it"
-        );
-      }
-    });
-
-    let workerAdapter = new MessageChannelNetworkAdapter(workerPort);
-    ({ repo, hive, signerIdentity } = await createRepo(workerAdapter));
-
-    // The worker was recreated with cold state: wire the repo onto the fresh
-    // port and drop the adapter stranded on the dead one.
-    const bootHive = hive;
-    onWorkerPortRenewed = (port) => {
-      const fresh = new MessageChannelNetworkAdapter(port);
-      // Mirror the boot wiring: a keyhive repo talks to the worker through a
-      // keyhive adapter wrapped around the message channel.
-      const registered = bootHive
-        ? bootHive.createKeyhiveNetworkAdapter(fresh, false, false, 2000)
-        : fresh;
-      repo.networkSubsystem.addNetworkAdapter(registered as any);
-      removeAdapterFor(repo, workerAdapter, registered);
-      workerAdapter = fresh;
-      lifecycleLog("repo re-wired to the recreated automerge worker");
-    };
+    ({ repo, hive, signerIdentity } = await createRepo());
   }
 
   // Dev-console / tool-runtime globals (e2e and loaded tools read these). The
   // `window.patchwork` handle is deliberately not set here — the caller does
   // `window.patchwork = await setup(...)`.
   window.repo = repo;
-  window.Automerge = Automerge as typeof import("@automerge/automerge");
+  window.Automerge = Automerge as typeof import("@automerge/automerge/slim");
   window.AutomergeRepo =
-    AutomergeRepo as typeof import("@automerge/automerge-repo");
+    AutomergeRepo as typeof import("@automerge/automerge-repo/slim");
   if (hive) window.hive = hive;
 
-  await repo.networkSubsystem.whenReady();
-  log("networkSubsystem ready");
   (hive?.networkAdapter as any)?.syncKeyhive?.();
 
   registerRepoProviderElement(repo as any);
@@ -213,7 +180,12 @@ async function doSetup(options: PatchworkOptions): Promise<Patchwork> {
     unregisterPlugins,
     // Discover an Automerge package's plugin descriptors off the main thread;
     // each plugin's load() re-imports the package (at heads) on this thread.
-    importAutomergePackageViaWorker
+    options.importModulesInWorker === false
+      ? undefined
+      : importAutomergePackageViaWorker,
+    // Look packages up through the automerge worker and watch them through
+    // the sync node, so their docs never load into this tab's Repo.
+    trackPackagesViaServiceWorker(watchDocument)
   );
 
   const accountDocHandle = (await resolveAccountHandle(repo, {
@@ -259,14 +231,13 @@ async function doSetup(options: PatchworkOptions): Promise<Patchwork> {
     plugins,
     sw: {
       connectClassicSync: sw.connectClassicSync,
-      subscribeToRepoChannel: sw.subscribeToRepoChannel,
-      subscribeSyncState: sw.subscribeSyncState,
+      subscribeSyncState: (documentId, listener) =>
+        subscribeSyncState(repo, documentId, listener),
     },
 
     async create<D>(type: string, init?: (doc: D) => void) {
-      const datatype = await getRegistry<DatatypeDescription>(
-        "patchwork:datatype"
-      ).load(type);
+      const datatype =
+        await getRegistry<DatatypeDescription>("patchwork:datatype").load(type);
       if (!datatype) {
         throw new Error(
           `patchwork.create: no datatype registered for "${type}"`
@@ -390,46 +361,48 @@ function wireModuleSettings(
   }
 }
 
-/** Page Lifecycle and connectivity transitions, to line up against the
- * SharedWorker's sync-socket reaps. */
-function installLifecycleLogging(): void {
-  if (typeof document === "undefined") return;
-  const opts = { capture: true } as const;
-  const persisted = (e: Event) => (e as PageTransitionEvent).persisted;
+// The tab's own Repo hears the server's heads directly, so this is a filter
+// over its `subduction-remote-heads` event. The current value is replayed
+// from the handle's sync info, when the server has reported any.
+function subscribeSyncState(
+  repo: Repo,
+  documentId: string,
+  listener: (update: SyncStateDocMessage) => void
+): () => void {
+  const onHeads = (payload: {
+    documentId: string;
+    storageId: string;
+    heads: readonly string[];
+    timestamp: number;
+  }) => {
+    if (payload.documentId !== documentId) return;
+    listener({
+      type: "sync-state",
+      documentId,
+      storageId: payload.storageId,
+      heads: [...payload.heads],
+      timestamp: payload.timestamp,
+    });
+  };
+  repo.on("subduction-remote-heads", onHeads);
 
-  document.addEventListener(
-    "visibilitychange",
-    () => lifecycleLog("visibilitychange → %s", document.visibilityState),
-    opts
-  );
-  document.addEventListener(
-    "freeze",
-    () => lifecycleLog("freeze (tab suspended)"),
-    opts
-  );
-  document.addEventListener(
-    "resume",
-    () => lifecycleLog("resume (tab unsuspended)"),
-    opts
-  );
-  window.addEventListener(
-    "pageshow",
-    (e) => lifecycleLog("pageshow persisted=%s", persisted(e)),
-    opts
-  );
-  window.addEventListener(
-    "pagehide",
-    (e) => lifecycleLog("pagehide persisted=%s", persisted(e)),
-    opts
-  );
-  window.addEventListener("online", () => lifecycleLog("online"), opts);
-  window.addEventListener("offline", () => lifecycleLog("offline"), opts);
+  void (async () => {
+    const handle = repo.handles[documentId as DocumentId];
+    if (!handle) return;
+    for (const storageId of await repo.connectedSubductionPeerIds()) {
+      const info = handle.getSyncInfo(storageId as StorageId);
+      if (info) {
+        onHeads({
+          documentId,
+          storageId,
+          heads: info.lastHeads,
+          timestamp: info.lastSyncTimestamp,
+        });
+      }
+    }
+  })();
 
-  lifecycleLog(
-    "logging installed (visibilityState=%s, hasFocus=%s)",
-    document.visibilityState,
-    document.hasFocus()
-  );
+  return () => repo.off("subduction-remote-heads", onHeads);
 }
 
 // ── Named exports ────────────────────────────────────────────────────────
@@ -447,4 +420,5 @@ export type {
   PatchworkOptions,
   ServiceWorkerApi,
   SignerIdentity,
+  SyncStateDocMessage,
 } from "./types.js";

@@ -1,4 +1,5 @@
 import {
+  type AutomergeUrl,
   type DocHandle,
   type Repo,
   isImmutableString,
@@ -35,6 +36,16 @@ type Walk = {
 /** A URL carries heads when it has a fragment: `automerge:abc#heads`. */
 const hasHeads = (url: unknown): boolean => String(url).includes("#");
 
+/**
+ * `value` as a link, if it is one. A link written as an `ImmutableString`
+ * (one op, where a plain string is an op per character) reads back as an
+ * object, not a string; it's the same url.
+ */
+function asLink(value: unknown): AutomergeUrl | undefined {
+  const url = isImmutableString(value) ? String(value) : value;
+  return typeof url === "string" && isValidAutomergeUrl(url) ? url : undefined;
+}
+
 export interface FolderStrategy {
   matches(doc: unknown): boolean;
   resolve(
@@ -59,12 +70,13 @@ const folderStrategy: FolderStrategy = {
     if (!folder?.docs) return undefined;
 
     const part = parts[0];
-    const docLink = folder.docs.find((doc) => doc.name === part);
-    if (!docLink) return undefined;
+    const docLink = folder.docs.find((doc) => String(doc.name) === part);
+    const url = asLink(docLink?.url);
+    if (!url) return undefined;
 
     // Following a bare link means everything below this point is current, not fixed.
-    walk.pinned &&= hasHeads(docLink.url);
-    const next = await repo.find(docLink.url);
+    walk.pinned &&= hasHeads(url);
+    const next = await repo.find(url);
     return resolvePathInternal(repo, next, parts.slice(1), walk);
   },
 };
@@ -84,14 +96,15 @@ async function walkDirectoryDoc(
   parts: string[],
   walk: Walk
 ): Promise<Resolved | undefined> {
-  if (typeof node === "string" && isValidAutomergeUrl(node)) {
+  const link = asLink(node);
+  if (link) {
     // Following a url consumes no parts, so revisiting the same url with the
     // same remaining parts is a cycle.
-    const key = `${node}|${parts.join("/")}`;
+    const key = `${link}|${parts.join("/")}`;
     if (walk.visited.has(key)) return undefined;
     walk.visited.add(key);
-    walk.pinned &&= hasHeads(node);
-    const next = await repo.find(node);
+    walk.pinned &&= hasHeads(link);
+    const next = await repo.find(link);
     return resolvePathInternal(repo, next, parts, walk);
   }
 
@@ -124,11 +137,12 @@ async function materialize(
   typeHint?: string,
   walk: Walk = { visited: new Set(), pinned: false }
 ): Promise<Resolved | undefined> {
-  if (typeof node === "string" && isValidAutomergeUrl(node)) {
-    if (walk.visited.has(node)) return undefined;
-    walk.visited.add(node);
-    walk.pinned &&= hasHeads(node);
-    const next = await repo.find(node);
+  const link = asLink(node);
+  if (link) {
+    if (walk.visited.has(link)) return undefined;
+    walk.visited.add(link);
+    walk.pinned &&= hasHeads(link);
+    const next = await repo.find(link);
     return materialize(repo, next.doc(), typeHint, walk);
   }
 
@@ -145,20 +159,32 @@ async function materialize(
   }
 
   if (node instanceof Uint8Array) {
-    return { content: node, type: typeHint ?? "application/octet-stream", pinned: walk.pinned };
+    return {
+      content: node,
+      type: typeHint ?? "application/octet-stream",
+      pinned: walk.pinned,
+    };
   }
 
   // String with a mime hint: pass through. Without: JSON-encode so the response
   // body matches the declared application/json type.
   if (typeof node === "string") {
     if (typeHint) return { content: node, type: typeHint, pinned: walk.pinned };
-    return { content: JSON.stringify(node), type: "application/json", pinned: walk.pinned };
+    return {
+      content: JSON.stringify(node),
+      type: "application/json",
+      pinned: walk.pinned,
+    };
   }
 
   if (isImmutableString(node)) {
     const s = String(node);
     if (typeHint) return { content: s, type: typeHint, pinned: walk.pinned };
-    return { content: JSON.stringify(s), type: "application/json", pinned: walk.pinned };
+    return {
+      content: JSON.stringify(s),
+      type: "application/json",
+      pinned: walk.pinned,
+    };
   }
 
   if (

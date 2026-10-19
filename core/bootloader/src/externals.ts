@@ -4,7 +4,7 @@ import { fileURLToPath } from "node:url";
 
 const require = createRequire(import.meta.url);
 
-export { default } from "./externals-list.js";
+export { default, slim } from "./externals-list.js";
 
 /**
  * pretend the import came from inside this package, so node_modules resolution
@@ -52,7 +52,7 @@ export function wasmAssets(): { fileName: string; path: string }[] {
     },
     {
       fileName: "keyhive_wasm.wasm",
-      path: require.resolve("@keyhive/keyhive/keyhive_wasm.wasm"),
+      path: require.resolve("@keyhive/keyhive/wasm"),
     },
     {
       fileName: "subduction.wasm",

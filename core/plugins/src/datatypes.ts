@@ -4,14 +4,15 @@ import {
   stringifyAutomergeUrl,
   type DocHandle,
   type Repo,
-} from "@automerge/automerge-repo";
+} from "@automerge/automerge-repo/slim";
 import type {
   LoadablePlugin,
   LoadedPlugin,
   PluginDescription,
 } from "./registry/types.js";
 import type { HasPatchworkMetadata } from "@inkandswitch/patchwork-filesystem";
-import type { AutomergeRepoKeyhive } from "@automerge/automerge-repo-keyhive";
+import type { AutomergeRepoKeyhiveBase as AutomergeRepoKeyhive } from "@automerge/automerge-repo-keyhive";
+import { isKeyhiveDoc } from "./keyhive.js";
 
 // Datatype implementation interface
 export type DatatypeImplementation<D = unknown> = {
@@ -42,7 +43,8 @@ export type LoadedDatatype<D = unknown> = LoadedPlugin<
 const splitImportUrl = (
   importUrl: string | undefined
 ): { url: string | undefined; frozen: string | undefined } => {
-  if (!isValidAutomergeUrl(importUrl)) return { url: importUrl, frozen: undefined };
+  if (!isValidAutomergeUrl(importUrl))
+    return { url: importUrl, frozen: undefined };
   const { documentId, heads } = parseAutomergeUrl(importUrl);
   if (!heads) return { url: importUrl, frozen: undefined };
   return { url: stringifyAutomergeUrl({ documentId }), frozen: importUrl };
@@ -57,7 +59,7 @@ export const createDocOfDatatype2 = async <D>(
 ): Promise<DocHandle<D & HasPatchworkMetadata>> => {
   const handle = await repo.create2<D & HasPatchworkMetadata>();
   // Add sync server with relay access
-  if (hive) {
+  if (hive && isKeyhiveDoc(handle.url)) {
     await hive.addSyncServerRelayToDoc(handle.url);
   }
   handle.change((doc: D & HasPatchworkMetadata) => {

@@ -1,5 +1,5 @@
 import type { AutomergeUrl, DocHandle, Repo } from "@automerge/vanillajs/slim";
-import type { AutomergeRepoKeyhive } from "@automerge/automerge-repo-keyhive";
+import type { AutomergeRepoKeyhiveBase as AutomergeRepoKeyhive } from "@automerge/automerge-repo-keyhive";
 import type {
   ModuleWatcher,
   HasPatchworkMetadata,
@@ -8,21 +8,27 @@ import type {
   AccountCreator,
   AccountDoc,
 } from "@inkandswitch/patchwork-plugins";
-import type {
-  ServiceWorkerRepoChannelListener,
-  SyncStateDocMessage,
-} from "@inkandswitch/patchwork-bootloader/types";
 import type * as pluginsNS from "@inkandswitch/patchwork-plugins";
 
 export type PluginsApi = typeof pluginsNS;
 
 export type SignerIdentity = { peerId: string; verifyingKey: string };
 
+/** The sync server's last-known heads for one document, as it reports them. */
+export interface SyncStateDocMessage {
+  type: "sync-state";
+  documentId: string;
+  storageId: string;
+  heads: string[];
+  timestamp: number;
+}
+
 export interface ServiceWorkerApi {
   connectClassicSync: (server?: string) => Promise<void>;
-  subscribeToRepoChannel: (
-    listener: ServiceWorkerRepoChannelListener
-  ) => Promise<() => void>;
+  /**
+   * Watch one document's heads at the sync server. Calls `listener` with
+   * what the server holds now, then on every update. Returns unsubscribe.
+   */
   subscribeSyncState: (
     documentId: string,
     listener: (update: SyncStateDocMessage) => void
@@ -91,7 +97,8 @@ export interface PatchworkOptions {
   /**
    * Bring your own Repo. When provided, setup skips wasm initialization and
    * repo creation entirely — you are responsible for having initialized
-   * automerge/subduction and wired the automerge-worker port yourself.
+   * automerge/subduction and wired the automerge-protocol-handler-worker
+   * port yourself.
    */
   repo?: Repo;
 
@@ -113,6 +120,14 @@ export interface PatchworkOptions {
    * Defaults to 30 seconds; `false` disables the deadline.
    */
   timeout?: number | false;
+
+  /**
+   * Discover an Automerge package's plugin descriptors in a dedicated module
+   * worker instead of importing the package on the main thread. Each plugin's
+   * `load()` still imports the package (at the same heads) on the main thread.
+   * Defaults to `true`; `false` imports every package directly.
+   */
+  importModulesInWorker?: boolean;
 }
 
 /**

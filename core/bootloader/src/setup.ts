@@ -1,31 +1,29 @@
 import type {
-  ServiceWorkerRepoChannelListener,
+  NewBuildInfo,
   SetupServiceWorkerOptions,
   SetupServiceWorkerResult,
-  SyncStateDocMessage,
 } from "./types.js";
+import { buildId, isNewerBuild } from "./build-id.js";
+import { promptForNewBuild } from "./new-build-prompt.js";
 import {
   readClassicSyncServer,
   DEFAULT_CLASSIC_SYNC_SERVER,
 } from "./sync-config.js";
 import debug from "debug";
+import type { AutomergeUrl } from "@automerge/automerge-repo/slim";
+import { PortSyncRemote, getSedimentreeId } from "./sync-remote.js";
+import type { SyncConnectMessage } from "./sync-protocol.js";
+export { relayKeyhive, type PortSyncRemote } from "./sync-remote.js";
 import {
-  donatePort,
-  isWorkerErrorMessage,
-} from "@automerge/automerge-repo/worker-port";
+  forwardWorkerConsole,
+  lifecycleLog,
+  sharedWorkerHandle,
+} from "./shared-worker-lifecycle.js";
+
+export { lifecycleLog };
 
 const serviceWorkerDebugging = debug.enabled("patchwork:serviceworker");
 const workerDebugging = debug.enabled("patchwork:automergeworker");
-
-export const lifecycleLog = debug("patchwork:lifecycle");
-
-function describeErrorEvent(event: Event): string {
-  const error = event as ErrorEvent;
-  const where = error.filename
-    ? ` (${error.filename}:${error.lineno}:${error.colno})`
-    : "";
-  return `${error.message || String(event)}${where}`;
-}
 
 // The version is cleared on every boot, so the steady state is
 // DEFAULT_CACHE_NAME. bumpServiceWorkerCache is a dev escape hatch: it moves
@@ -65,348 +63,114 @@ function installServiceWorkerLogForwarding(): void {
   });
 }
 
-// The automerge repo lives in a SharedWorker. one instance serves every
-// tab. Browsers might kill a SharedWorker under memory pressure, so we
-// heartbeat it and rebuild everything if it dies.
+// ── New builds ─────────────────────────────────────────────────────────
+// After a deploy, open tabs are on the old build. The default response is to
+// say so and offer a reload, rather than reload out from under someone
+// mid-edit; an old page sharing IndexedDB with the new automerge worker is
+// still where storage-format changes bite, so it shouldn't stay that way long.
 
-let automergeWorkerPath = "/automerge-worker.js";
-let automergeWorker: SharedWorker | undefined;
-// A repo port opened against instance N is stale once instance N+1 exists — its
-// channel ends in a dead worker — so deliveries are guarded on generation.
-let workerGeneration = 0;
-let disposeWorkerDeathDetection: (() => void) | undefined;
-const repoChannelListeners = new Set<ServiceWorkerRepoChannelListener>();
-let recoveringWorker = false;
-let lastWorkerRecoveryAt = 0;
-// Below this spacing, skip: if the fresh worker is dead too, its own heartbeat
-// re-triggers recovery later rather than spinning in a tight loop.
-const RECOVERY_MIN_INTERVAL_MS = 15_000;
-let nextRepoChannelId = 0;
+let onNewBuild: ((info: NewBuildInfo) => void) | undefined;
 
-// Chrome can't spawn workers inside a SharedWorker, so each tab offers this
-// proxy's port to the automerge worker, which requests one via its port
-// provider. Being a SharedWorker itself, the proxy — and the donated
-// worker↔worker port — outlives the donor tab.
-const SUBDUCTION_IO_WORKER_URL =
-  "/packages/@automerge/automerge-repo/subduction-websocket-worker-shared.js";
-
-export function getAutomergeWorker(): SharedWorker {
-  if (automergeWorker) return automergeWorker;
-
-  workerGeneration++;
-  const worker = new SharedWorker(automergeWorkerPath, {
-    name: "patchwork-automerge",
-    type: "module",
-  });
-  automergeWorker = worker;
-
-  // Fires when a message can't be structured-deserialized. Silent otherwise:
-  // the message is dropped, which looks identical to a worker that never
-  // replied.
-  worker.port.addEventListener("messageerror", (event) => {
-    console.error(
-      "[automerge-worker] undeserializable message from worker:",
-      event
-    );
-  });
-  // Control replies come back on this port, and we listen with
-  // addEventListener rather than onmessage, so it needs start().
-  worker.port.start();
-  worker.port.addEventListener("message", handleWorkerMessage);
-  worker.port.postMessage({ type: "debug", debug: workerDebugging });
-
-  donatePort(worker.port, createSubductionIoPort);
-  disposeWorkerDeathDetection = installWorkerDeathDetection(worker);
-  return worker;
-}
-
-function handleWorkerMessage(event: MessageEvent): void {
-  const data = event.data;
-
-  if (data?.type === "sync-state") {
-    dispatchSyncState(data as SyncStateDocMessage);
-    return;
-  }
-
-  // Crash/skew reports relayed from the subduction io proxy (e.g. a protocol
-  // mismatch from a stale SW-cached worker chunk). These otherwise only exist
-  // in chrome://inspect.
-  if (isWorkerErrorMessage(data)) {
-    console.error("[subduction-io]", data);
-    return;
-  }
-
-  if (data?.type !== "console") return;
-  const { level, args } = data;
-  if (
-    !lifecycleLog.enabled &&
-    typeof args?.[0] === "string" &&
-    args[0].includes("[lifecycle]")
-  ) {
-    return;
-  }
-  const write = (console as any)[level] ?? console.log;
-  // The worker's logs carry %c directives in args[0] with CSS in the following
-  // args, so the tag has to go inside the format string or the CSS prints raw.
-  if (typeof args[0] === "string") {
-    write(`[automerge-worker] ${args[0]}`, ...args.slice(1));
-  } else {
-    write("[automerge-worker]", ...args);
-  }
-}
-
-function createSubductionIoPort(): MessagePort {
-  const io = new SharedWorker(SUBDUCTION_IO_WORKER_URL, {
-    type: "module",
-    name: "subduction-websocket",
-  });
-  // This worker carries the websocket to the sync server, so a load failure
-  // stops sync with no other symptom.
-  io.addEventListener("error", (event) => {
-    console.error(
-      `[subduction-io] failed to load/run ${SUBDUCTION_IO_WORKER_URL}:`,
-      describeErrorEvent(event)
-    );
-  });
-  io.port.addEventListener("messageerror", (event) => {
-    console.error("[subduction-io] undeserializable message:", event);
-  });
-  return io.port;
+function newBuild(info: NewBuildInfo): void {
+  lifecycleLog("new build detected via %s", info.source);
+  (onNewBuild ?? promptForNewBuild)(info);
 }
 
 /**
- * Build a replacement worker and re-wire everything a live tab holds against
- * it: console forwarding and port donation (both re-done by
- * getAutomergeWorker), the per-doc sync-state subscriptions, and every
- * subscriber's repo port. The new instance boots with cold state.
+ * The build a service worker was compiled from, or undefined if it doesn't
+ * say (one from before this existed) within a couple of seconds.
  */
-async function recoverAutomergeWorker(
-  reason: string,
-  deadWorker: SharedWorker
-): Promise<void> {
-  if (deadWorker !== automergeWorker) return;
-  if (recoveringWorker) return;
-  const now = Date.now();
-  if (now - lastWorkerRecoveryAt < RECOVERY_MIN_INTERVAL_MS) return;
-  recoveringWorker = true;
-  lastWorkerRecoveryAt = now;
-  lifecycleLog("recreating the automerge SharedWorker (%s)", reason);
-
-  try {
-    disposeWorkerDeathDetection?.();
-    disposeWorkerDeathDetection = undefined;
-    automergeWorker = undefined;
-    try {
-      deadWorker.port.close();
-    } catch {}
-
-    const fresh = getAutomergeWorker();
-    for (const documentId of syncStateListeners.keys()) {
-      fresh.port.postMessage({ type: "sync-sub", documentId });
-    }
-    for (const listener of repoChannelListeners) {
-      try {
-        const generation = workerGeneration;
-        const port = await openRepoChannel();
-        // Replaced again while we waited — the newer recovery re-delivers.
-        if (generation !== workerGeneration) break;
-        await listener(port);
-      } catch (err) {
-        console.error(
-          "failed to re-wire a repo channel after worker recovery",
-          err
-        );
-      }
-    }
-  } finally {
-    recoveringWorker = false;
-  }
+function serviceWorkerBuild(sw: ServiceWorker): Promise<number | undefined> {
+  const { port1, port2 } = new MessageChannel();
+  return new Promise<number | undefined>((resolve) => {
+    const timeout = setTimeout(() => resolve(undefined), 2_000);
+    port1.onmessage = (event) => {
+      clearTimeout(timeout);
+      resolve(
+        typeof event.data?.build === "number" ? event.data.build : undefined
+      );
+    };
+    sw.postMessage({ type: "build" }, [port2]);
+  }).finally(() => port1.close());
 }
 
-// A silent port is not proof of death: the worker may still be evaluating its
-// module graph, or be busy with wasm/sync work. In both cases every queued
-// message — including the repo ports the network adapters ride on — is
-// delivered once it catches up, and tearing the port down would lose them. So
-// silence only starts a non-destructive probe: a second connection to the same
-// instance. Only if the probe gets a `hello` while this port stays silent do we
-// know the instance is alive but our port is stranded, and recover.
-const HEARTBEAT_MS = 5_000;
-const HEARTBEAT_TIMEOUT_MS = 25_000;
-// An idle worker hellos within milliseconds of connecting, so before first
-// contact the budget is tighter — probing early rescues stranded boots fast.
-const FIRST_CONTACT_TIMEOUT_MS = 4_000;
-// After a slow boot both connections hello at roughly the same moment and
-// cross-port delivery order isn't guaranteed, so give the suspect this long to
-// also speak before concluding it's stranded.
-const PROBE_GRACE_MS = 500;
+// ── The automerge worker ───────────────────────────────────────────────
+// A SharedWorker holding the Repo that resolves `automerge:` URLs for the
+// service worker, and the sync node every tab's Repo syncs through. Each tab
+// keeps it alive and heartbeats it, so it's here rather than in the service
+// worker, which can't own one.
 
-function installWorkerDeathDetection(worker: SharedWorker): () => void {
-  let instanceId: string | undefined;
-  let lastHeardAt = Date.now();
-  let warnedUnresponsive = false;
-  let warnedSendFailed = false;
-  let disposed = false;
-  let probe: SharedWorker | undefined;
-  let seq = 0;
+let automergeProtocolHandlerWorkerPath =
+  "/automerge-protocol-handler-worker.js";
 
-  const closeProbe = () => {
-    if (!probe) return;
-    try {
-      probe.port.close();
-    } catch {}
-    probe = undefined;
-  };
+const automergeProtocolHandlerWorker = sharedWorkerHandle(
+  "patchwork-automerge-protocol-handler",
+  () => automergeProtocolHandlerWorkerPath,
+  {
+    debugging: workerDebugging,
+    onMessage(event) {
+      forwardWorkerConsole("automerge-protocol-handler-worker", event.data);
+    },
+    onRestarting(message) {
+      // Ask the replacement for a sync port now: posts are held until it's
+      // up, and this one's sync node is going away with it.
+      syncRemote?.reconnect();
+      // The worker restarts because a newer tab connected. If that build is
+      // newer than ours too, we're the stale one.
+      if (isNewerBuild(message.build)) {
+        newBuild({
+          source: "shared-worker",
+          build: message.build,
+          current: buildId,
+        });
+      }
+    },
+  }
+);
 
-  worker.port.addEventListener("message", (event: MessageEvent) => {
-    const data = event.data;
-    if (data?.type !== "hello" && data?.type !== "pong") return;
-    lastHeardAt = Date.now();
-    warnedUnresponsive = false;
-    closeProbe();
-    if (instanceId === undefined) {
-      instanceId = data.instanceId;
-      lifecycleLog(
-        "automerge SharedWorker instance %s (via %s)",
-        data.instanceId,
-        data.type
-      );
-    } else if (data.instanceId && data.instanceId !== instanceId) {
-      lifecycleLog(
-        "automerge SharedWorker instance changed (instance %s, was %s)",
-        data.instanceId,
-        instanceId
-      );
-      instanceId = data.instanceId;
-    }
-  });
+export function getAutomergeProtocolHandlerWorker(): SharedWorker {
+  return automergeProtocolHandlerWorker.get();
+}
 
-  worker.port.addEventListener("close", () => {
-    if (disposed) return;
-    lifecycleLog("automerge SharedWorker control port closed");
-    void recoverAutomergeWorker("control port closed", worker);
-  });
+let syncRemote: PortSyncRemote | undefined;
 
-  // Not gated on the debug namespace: a worker that fails to load never replies
-  // to anything, and this is the only signal that says so.
-  worker.addEventListener("error", (event) => {
-    console.error("automerge SharedWorker error:", describeErrorEvent(event));
-  });
-
-  const startProbe = (reason: string) => {
-    if (probe || disposed) return;
-    lifecycleLog(
-      "automerge SharedWorker %s; probing with a second connection",
-      reason
+/**
+ * This tab's connection to the sync node in the automerge worker, to pass to
+ * its Repo as `subductionRemote`. One per tab: it follows the worker across
+ * restarts.
+ */
+export function getSyncRemote(): PortSyncRemote {
+  syncRemote ??= new PortSyncRemote(() => {
+    const { port1, port2 } = new MessageChannel();
+    automergeProtocolHandlerWorker.post(
+      { type: "sync-connect" } satisfies SyncConnectMessage,
+      [port2]
     );
-    const startedAt = Date.now();
-    const p = new SharedWorker(automergeWorkerPath, {
-      name: "patchwork-automerge",
-      type: "module",
-    });
-    probe = p;
-    p.port.start();
-    p.port.addEventListener("message", (event: MessageEvent) => {
-      if (event.data?.type !== "hello") return;
-      setTimeout(() => {
-        if (disposed || probe !== p) return;
-        closeProbe();
-        // The suspect spoke while the probe ran: it was merely busy, and
-        // everything queued on it has been delivered.
-        if (lastHeardAt >= startedAt) return;
-        void recoverAutomergeWorker(
-          `port unresponsive on a live worker (${reason}; probe confirmed)`,
-          worker
-        );
-      }, PROBE_GRACE_MS);
-    });
-    // No hello on the probe means the instance is loading or busy. The probe
-    // waits indefinitely rather than tearing anything down on a timer.
-  };
-
-  const heartbeat = setInterval(() => {
-    try {
-      worker.port.postMessage({ type: "ping", id: ++seq });
-    } catch (error) {
-      // Without this a failed send is indistinguishable from a dead worker.
-      if (!warnedSendFailed) {
-        warnedSendFailed = true;
-        console.error("automerge SharedWorker ping send threw", error);
-      }
-    }
-
-    const neverHeard = instanceId === undefined;
-    const silentMs = Date.now() - lastHeardAt;
-    const timeoutMs = neverHeard
-      ? FIRST_CONTACT_TIMEOUT_MS
-      : HEARTBEAT_TIMEOUT_MS;
-    if (silentMs <= timeoutMs) return;
-
-    // First contact probes regardless of visibility: SharedWorkers don't
-    // suspend with the tab, and the probe destroys nothing. Post-contact
-    // silence defers to visibility, since a hidden page's throttling can fake
-    // it.
-    const visible =
-      typeof document === "undefined" || document.visibilityState === "visible";
-    if (!neverHeard && !visible) return;
-
-    const seconds = Math.round(silentMs / 1000);
-    const reason = neverHeard
-      ? `no hello ~${seconds}s after connecting`
-      : `no pong for ~${seconds}s`;
-    if (!warnedUnresponsive) {
-      warnedUnresponsive = true;
-      lifecycleLog("automerge SharedWorker %s (tab visible)", reason);
-    }
-    startProbe(reason);
-  }, HEARTBEAT_MS);
-
-  return () => {
-    disposed = true;
-    clearInterval(heartbeat);
-    closeProbe();
-  };
+    return port1;
+  });
+  return syncRemote;
 }
 
-// Ref-counted locally so several callers in this tab can watch the same doc
-// with a single worker subscription.
-type SyncStateListener = (update: SyncStateDocMessage) => void;
-const syncStateListeners = new Map<string, Set<SyncStateListener>>();
-
-function dispatchSyncState(update: SyncStateDocMessage): void {
-  for (const listener of syncStateListeners.get(update.documentId) ?? []) {
-    try {
-      listener(update);
-    } catch (err) {
-      console.error("sync-state listener threw", err);
-    }
-  }
-}
-
-export function subscribeSyncState(
-  documentId: string,
-  listener: SyncStateListener
+/**
+ * Call `onChange` whenever the document at `url` may have new heads, until the
+ * returned function is called. Nothing is loaded for it: the sync node keeps
+ * the document subscribed with the server and says when something arrives for
+ * it, whether from the server or from another tab. That's the way to follow a
+ * document whose contents you only need now and then; find it again when
+ * `onChange` fires.
+ */
+export function watchDocument(
+  url: AutomergeUrl,
+  onChange: () => void
 ): () => void {
-  const worker = getAutomergeWorker();
-  let listeners = syncStateListeners.get(documentId);
-  if (!listeners) {
-    syncStateListeners.set(documentId, (listeners = new Set()));
-    worker.port.postMessage({ type: "sync-sub", documentId });
-  }
-  listeners.add(listener);
+  return getSyncRemote().watch(getSedimentreeId(url), onChange);
+}
 
-  let active = true;
-  return () => {
-    if (!active) return;
-    active = false;
-    const set = syncStateListeners.get(documentId);
-    if (!set) return;
-    set.delete(listener);
-    if (set.size > 0) return;
-    syncStateListeners.delete(documentId);
-    // Unsubscribe from whichever instance is current: recovery replays
-    // subscriptions onto a new worker, so it may not be the one captured above.
-    automergeWorker?.port.postMessage({ type: "sync-unsub", documentId });
-  };
+/** Dev escape hatch: make the shared worker close so the next use respawns it. */
+export function restartAutomergeProtocolHandlerWorker(
+  reason = "restartAutomergeProtocolHandlerWorker() called"
+): void {
+  automergeProtocolHandlerWorker.restart(reason);
 }
 
 export function connectClassicSync(
@@ -419,7 +183,6 @@ export function connectClassicSync(
     );
   }
 
-  const worker = getAutomergeWorker();
   const { port1, port2 } = new MessageChannel();
   return new Promise((resolve, reject) => {
     const timeout = setTimeout(() => {
@@ -433,69 +196,14 @@ export function connectClassicSync(
       else
         reject(new Error(event.data?.error ?? "connect-classic-sync failed"));
     };
-    worker.port.postMessage({ type: "connect-classic-sync", server: url }, [
-      port2,
-    ]);
-  });
-}
-
-function sendRepoPort(id: number): MessagePort {
-  const { port1, port2 } = new MessageChannel();
-  getAutomergeWorker().port.postMessage({ type: "port", id }, [port2]);
-  return port1;
-}
-
-/**
- * Wait for the worker to confirm its repo is constructed. The MessageChannel
- * adapter's whenReady() force-resolves after 100ms regardless of the other
- * end's state, so it can't serve as a readiness signal on first boot, when the
- * worker still has to fetch wasm and build its repo.
- */
-function awaitPortReady(control: MessagePort, id: number): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const cleanup = () => {
-      clearTimeout(timeout);
-      control.removeEventListener("message", listener);
-    };
-    const listener = (event: MessageEvent) => {
-      if (event.data?.id !== id) return;
-      if (event.data.type === "port-ready") {
-        cleanup();
-        resolve();
-      } else if (event.data.type === "port-failed") {
-        cleanup();
-        reject(new Error(`automerge worker init failed: ${event.data.error}`));
-      }
-    };
-    control.addEventListener("message", listener);
-    const timeout = setTimeout(() => {
-      cleanup();
-      reject(new Error("automerge worker port-ready timeout"));
-    }, 30_000);
-  });
-}
-
-async function openRepoChannel(): Promise<MessagePort> {
-  const id = ++nextRepoChannelId;
-  const ready = awaitPortReady(getAutomergeWorker().port, id);
-  const port = sendRepoPort(id);
-  try {
-    await ready;
-  } catch (err) {
-    // Surface the problem and let the rest of the site come up rather than
-    // hanging on a blank page.
-    console.warn(
-      "proceeding without worker ready ack:",
-      err instanceof Error ? err.message : err
+    automergeProtocolHandlerWorker.post(
+      { type: "connect-classic-sync", server: url },
+      [port2]
     );
-  }
-  return port;
+  });
 }
 
-/** Open a fresh repo sync port to the automerge worker (dev console). */
-function getRepoChannel(): MessagePort {
-  return sendRepoPort(++nextRepoChannelId);
-}
+// ── Boot ───────────────────────────────────────────────────────────────
 
 function waitForActive(reg: ServiceWorkerRegistration): Promise<ServiceWorker> {
   if (reg.active) return Promise.resolve(reg.active);
@@ -521,6 +229,7 @@ export default async function setupServiceWorker(
   // activate markers are rendered here.
   installServiceWorkerLogForwarding();
   localStorage.removeItem(CACHE_VERSION_KEY);
+  onNewBuild = options?.onNewBuild;
 
   // Cache growth can otherwise trip origin-wide eviction, which would take the
   // Automerge IndexedDB — the user's documents — with it. Chrome/Safari decide
@@ -528,11 +237,11 @@ export default async function setupServiceWorker(
   // default eviction.
   void navigator.storage?.persist?.().catch(() => {});
 
-  if (options?.workerPath) automergeWorkerPath = options.workerPath;
+  if (options?.workerPath)
+    automergeProtocolHandlerWorkerPath = options.workerPath;
 
-  // Start the automerge worker now so it boots wasm and its repo while the
-  // service worker installs.
-  const shared = getAutomergeWorker();
+  // Start it now so it boots wasm while the service worker installs.
+  const shared = automergeProtocolHandlerWorker.get();
 
   const reg = await navigator.serviceWorker.register(
     options?.path ?? "/service-worker.js",
@@ -557,9 +266,18 @@ export default async function setupServiceWorker(
   }
 
   // A replacement worker boots with the default cache name, so reconfigure
-  // whenever a new one takes control.
-  navigator.serviceWorker.addEventListener("controllerchange", () => {
-    configureServiceWorker(navigator.serviceWorker.controller);
+  // whenever a new one takes control. A new one taking control is also how a
+  // deploy shows up: the service worker skipWaiting()s and claims every open
+  // tab. But it also claims the tab whose load installed it, which is already
+  // on the new build, so only a worker from a newer build than ours counts.
+  navigator.serviceWorker.addEventListener("controllerchange", async () => {
+    const controller = navigator.serviceWorker.controller;
+    configureServiceWorker(controller);
+    if (!controller) return;
+    const build = await serviceWorkerBuild(controller);
+    if (isNewerBuild(build)) {
+      newBuild({ source: "service-worker", build, current: buildId });
+    }
   });
 
   console.log(
@@ -567,27 +285,9 @@ export default async function setupServiceWorker(
     "background: #fcf2f0; color: #333; border: 2px solid; border-radius: 4px"
   );
 
-  return {
-    shared,
-    connectClassicSync,
-    getRepoChannel,
-    subscribeSyncState,
-    // Called once with the boot port. If the automerge worker later dies and is
-    // recreated, the listener is called again with a fresh port — treat every
-    // call as "(re)wire your repo's sync onto this port".
-    async subscribeToRepoChannel(listener: ServiceWorkerRepoChannelListener) {
-      repoChannelListeners.add(listener);
-      const generation = workerGeneration;
-      const port = await openRepoChannel();
-      // If the worker was replaced while this channel was opening, recovery has
-      // already delivered a good port to this listener — drop the stale one
-      // rather than wiring the repo to a dead channel.
-      if (generation === workerGeneration) await listener(port);
-      return () => {
-        repoChannelListeners.delete(listener);
-      };
-    },
-  };
+  return { shared, connectClassicSync };
 }
 
 (window as any).bumpServiceWorkerCache = bumpServiceWorkerCache;
+(window as any).restartAutomergeProtocolHandlerWorker =
+  restartAutomergeProtocolHandlerWorker;

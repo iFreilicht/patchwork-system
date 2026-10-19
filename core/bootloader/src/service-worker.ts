@@ -5,6 +5,10 @@ import {
   type HandoffReplyMessage,
   type HandoffRequestMessage,
 } from "./types.js";
+// Referenced so this script's bytes change with every build. The browser only
+// installs a replacement service worker when they do, and the controllerchange
+// that follows is how open tabs learn a deploy happened (see setup.ts).
+import { buildId } from "./build-id.js";
 
 const DEFAULT_CACHE_NAME = "patchwork";
 
@@ -63,7 +67,10 @@ self.addEventListener("unhandledrejection", (event) => {
 // ── Lifecycle ──────────────────────────────────────────────────────────
 
 self.addEventListener("install", (event) => {
-  lifecycle("info", "install (skipWaiting)");
+  lifecycle(
+    "info",
+    `install (skipWaiting)${buildId === undefined ? "" : ` build ${buildId}`}`
+  );
   // waitUntil keeps the worker alive until skipWaiting resolves, so a freshly
   // installed worker reliably jumps the waiting queue instead of stalling until
   // every old tab closes.
@@ -108,6 +115,13 @@ self.addEventListener("activate", (event) => {
 
 self.addEventListener("message", async (event) => {
   const data = event.data;
+
+  // A tab that just came under this worker's control asks which build it is,
+  // to tell a deploy (we're newer than the tab) from its own first load.
+  if (data?.type === "build") {
+    event.ports[0]?.postMessage({ type: "build", build: buildId });
+    return;
+  }
 
   if (data?.type === "debug") {
     debugging = data.debug;
@@ -344,7 +358,10 @@ async function servePassthrough(
       CACHEABLE_STATUSES.includes(result.status) &&
       /^https?:/.test(request.url)
     ) {
-      cacheInBackground(fetchEvent, cache, request, result.clone());
+      const etag = result.headers.get("etag");
+      if (!etag || etag !== cached?.headers.get("etag")) {
+        cacheInBackground(fetchEvent, cache, request, result.clone());
+      }
     } else {
       log(`not caching status ${result.status} for ${request.url}`);
     }

@@ -1,6 +1,7 @@
 import type { Plugin, ServerOptions, PreviewOptions, BuildOptions } from "vite";
 
 import { importmap } from "./importmap-plugin.js";
+import { patches } from "./patches-plugin.js";
 import { serviceworker } from "./service-worker-plugin.js";
 import { config, wasm } from "./config-plugin.js";
 import { dev } from "./dev-plugin.js";
@@ -42,6 +43,7 @@ export default function patchwork(options?: PatchworkVitePluginOptions) {
     manifest(options),
     netlify(options),
     importmap(options),
+    patches(),
     serviceworker(),
     dev(options),
     statics(options),
@@ -50,6 +52,7 @@ export default function patchwork(options?: PatchworkVitePluginOptions) {
 }
 
 export { importmap, builtins, devDependencyId } from "./importmap-plugin.js";
+export { patches } from "./patches-plugin.js";
 export { serviceworker, workers } from "./service-worker-plugin.js";
 export { config, buildDefines, wasm } from "./config-plugin.js";
 export { dev } from "./dev-plugin.js";
@@ -74,6 +77,7 @@ export type {
   PatchworkHtmlOptions,
   PatchworkNetlifyOptions,
   PatchworkKeyhiveSyncServer,
+  PatchworkKeyhiveOptions,
   PatchworkSyncServersOptions,
 } from "../site-kit/options.js";
 
@@ -93,6 +97,16 @@ export interface PatchworkVitePluginOptions extends PatchworkSiteOptions {
    * whatever else the site wants recorded.
    */
   buildInfo?: boolean | Record<string, unknown>;
+  /**
+   * This build's id (-> __BUILD_ID__ define), a number where later builds
+   * compare greater. Defaults to `Date.now()` when the build starts. A tab
+   * from a newer build connecting to the shared automerge worker makes it
+   * restart on the new code, and tabs on older builds offer to reload. Set it from a
+   * CI run number to make it deterministic; keep it increasing, since a
+   * build with a lower id than the one running is left alone (so to roll
+   * back, rebuild rather than republish an old build).
+   */
+  buildId?: number;
 
   server?: false | ServerOptions;
   preview?: false | PreviewOptions;

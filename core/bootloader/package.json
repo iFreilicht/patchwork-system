@@ -5,11 +5,12 @@
     "url": "git+https://github.com/inkandswitch/patchwork-system.git",
     "directory": "core/bootloader"
   },
-  "version": "0.6.2",
+  "version": "0.8.2",
   "author": "chee",
   "type": "module",
   "license": "MIT",
   "devDependencies": {
+    "vitest": "^3.2.6",
     "esbuild": "^0.23.1",
     "rollup": "^4.61.1"
   },
@@ -26,6 +27,10 @@
       "import": "./dist/externals-list.js",
       "types": "./dist/externals-list.d.ts"
     },
+    "./signer": {
+      "import": "./dist/signer.js",
+      "types": "./dist/signer.d.ts"
+    },
     "./storage": {
       "import": "./dist/storage.js",
       "types": "./dist/storage.d.ts"
@@ -34,9 +39,9 @@
       "import": "./dist/service-worker.js",
       "types": "./dist/service-worker.d.ts"
     },
-    "./automerge-worker": {
-      "import": "./dist/automerge-worker.js",
-      "types": "./dist/automerge-worker.d.ts"
+    "./automerge-protocol-handler-worker": {
+      "import": "./dist/automerge-protocol-handler-worker.js",
+      "types": "./dist/automerge-protocol-handler-worker.d.ts"
     },
     "./module-loader": {
       "import": "./dist/module-loader.js",
@@ -56,6 +61,7 @@
     "@automerge/automerge": "catalog:",
     "@automerge/automerge-repo": "catalog:",
     "@automerge/automerge-repo-keyhive": "catalog:",
+    "@automerge/automerge-repo-network-broadcastchannel": "catalog:",
     "@automerge/automerge-repo-network-messagechannel": "catalog:",
     "@automerge/automerge-repo-network-websocket": "catalog:",
     "@automerge/automerge-repo-storage-indexeddb": "catalog:",
@@ -99,6 +105,7 @@
   },
   "scripts": {
     "build": "tsc && cp src/global.css dist/global.css",
+    "test": "vitest run",
     "dev": "tsc -w --preserveWatchOutput"
   }
 }

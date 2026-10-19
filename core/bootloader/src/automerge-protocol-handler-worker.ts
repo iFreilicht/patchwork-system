@@ -1,0 +1,637 @@
+// The Repo that resolves `automerge:` URLs for the service worker, in a
+// SharedWorker: one instance serves every tab and lives as long as any tab
+// does.
+//
+// It also hosts the origin's sync node (sync-node.ts), the one Subduction node
+// with a connection to the sync server. Every tab's Repo syncs through it, and
+// so does the resolver Repo here, which is otherwise a Repo like any tab's: the
+// same IndexedDB and the storage channel to the tabs.
+// When the service worker misses the cache for a request that looks like a URL
+// encoded URL, it broadcasts a HandoffRequestMessage on HANDOFF_CHANNEL; we
+// resolve the automerge URL, write the response into the service worker's
+// cache (keyed by a Request reconstructed to match the one it's holding), and
+// reply on the same channel.
+import { initializeWasm, hasHeads } from "@automerge/automerge/slim";
+// eslint-disable-next-line
+// @ts-ignore — the default init is a wasm-bindgen runtime helper not in the .d.ts
+import initSubduction from "@automerge/automerge-subduction/slim";
+
+import {
+  INTERCEPTOR_PREFIX,
+  Repo,
+  isValidAutomergeUrl,
+  parseAutomergeUrl,
+  stringifyAutomergeUrl,
+  type AutomergeUrl,
+  type DocHandle,
+  type DocumentId,
+  type PeerId,
+  type StorageId,
+} from "@automerge/automerge-repo/slim";
+import {
+  getDefaultBranch,
+  resolvePath,
+} from "@inkandswitch/patchwork-filesystem";
+
+import { IndexedDBStorageAdapter } from "@automerge/automerge-repo-storage-indexeddb";
+import { WebSocketWorkerClientAdapter } from "@automerge/automerge-repo-network-websocket";
+import type {
+  AutomergeRepoKeyhive,
+  SyncServerSelection,
+} from "@automerge/automerge-repo-keyhive";
+
+import { DEFAULT_CLASSIC_SYNC_SERVER } from "./sync-config.js";
+import { loadKeyhiveSigner, loadOrCreateSigner } from "./signer.js";
+import { keyhiveStorageName, storagePrefix } from "./storage.js";
+import { startWorkerControl } from "./worker-control.js";
+import { SyncNode } from "./sync-node.js";
+import { PortSyncRemote, relayKeyhive } from "./sync-remote.js";
+import {
+  HANDOFF_CHANNEL,
+  type HandoffCachedMessage,
+  type HandoffOnlineMessage,
+  type HandoffAbortMessage,
+  type HandoffRequestMessage,
+  type HandoffResponseMessage,
+} from "./types.js";
+
+declare const __SYNC_SERVER__: {
+  url: string;
+  keyhive?: SyncServerSelection;
+  useIdFactory?: boolean;
+};
+
+const syncServer =
+  typeof __SYNC_SERVER__ !== "undefined"
+    ? __SYNC_SERVER__
+    : { url: "wss://subduction.sync.inkandswitch.com" };
+
+const RESOLVE_TIMEOUT_MS = 30_000;
+
+const CACHEABLE_STATUSES = [200, 203, 204];
+
+const control = startWorkerControl("automerge-protocol-handler-worker", {
+  onMessage: handleControlMessage,
+  onRestart: drainForRestart,
+});
+const log = control.log;
+
+// ── The sync node ──────────────────────────────────────────────────────
+
+let wasmPromise: Promise<void> | null = null;
+
+function initWasm(): Promise<void> {
+  if (!wasmPromise) {
+    log("fetching wasm");
+    wasmPromise = Promise.all([
+      initializeWasm(new Request("/automerge.wasm")),
+      initSubduction(new Request("/subduction.wasm")),
+    ]).then(() => log("wasm initialized"));
+    wasmPromise.catch(() => {
+      wasmPromise = null;
+    });
+  }
+  return wasmPromise;
+}
+
+let syncNodePromise: Promise<SyncNode> | null = null;
+
+function getSyncNode(): Promise<SyncNode> {
+  if (!syncNodePromise) {
+    syncNodePromise = (async () => {
+      await initWasm();
+      const storage = new IndexedDBStorageAdapter();
+      // On keyhive sites the Repos store encrypted documents under the
+      // interceptor's prefix and sign as the keyhive identity.
+      const node = new SyncNode({
+        signer: syncServer.keyhive
+          ? await loadKeyhiveSigner(
+              new IndexedDBStorageAdapter(keyhiveStorageName)
+            )
+          : await loadOrCreateSigner(storage),
+        storage,
+        storagePrefix: syncServer.keyhive ? INTERCEPTOR_PREFIX : undefined,
+        endpoints: [syncServer.url],
+        log,
+      });
+      (self as any).syncNode = node;
+      return node;
+    })();
+    syncNodePromise.catch(() => {
+      syncNodePromise = null;
+    });
+  }
+  return syncNodePromise;
+}
+
+/** Serve a Repo on `port` once the node is up; messages queue until then. */
+function connectToSyncNode(port: MessagePort): void {
+  getSyncNode().then(
+    (node) => node.connect(port),
+    (error) => {
+      console.error("sync node failed to start", error);
+      port.close();
+    }
+  );
+}
+
+/** The resolver Repo's connection to the node, which lives right here. */
+function resolverRemote(): PortSyncRemote {
+  return new PortSyncRemote(() => {
+    const { port1, port2 } = new MessageChannel();
+    connectToSyncNode(port2);
+    return port1;
+  });
+}
+
+// ── The repo ───────────────────────────────────────────────────────────
+
+let repoPromise: Promise<Repo> | null = null;
+
+function getRepo(): Promise<Repo> {
+  if (!repoPromise) {
+    repoPromise = buildRepo();
+    // Don't cache a rejection (e.g. the wasm fetch failed): clear the slot so
+    // the next caller retries from scratch.
+    repoPromise.catch(() => {
+      repoPromise = null;
+    });
+  }
+  return repoPromise;
+}
+
+async function buildRepo(): Promise<Repo> {
+  await initWasm();
+
+  const { repo, hive } = syncServer.keyhive
+    ? await buildKeyhiveRepo(syncServer.keyhive)
+    : { repo: await buildPlainRepo() };
+
+  (self as any).repo = repo;
+  if (hive) (self as any).hive = hive;
+  return repo;
+}
+
+async function buildPlainRepo(): Promise<Repo> {
+  const storage = new IndexedDBStorageAdapter();
+  return new Repo({
+    signer: await loadOrCreateSigner(storage),
+    storage,
+    peerId:
+      `${storagePrefix}-resolver-${Math.random().toString(36).slice(2)}` as PeerId,
+    subductionRemote: resolverRemote(),
+    headsChannel: `${storagePrefix}-heads`,
+    enableRemoteHeadsGossiping: true,
+  });
+}
+
+async function buildKeyhiveRepo(
+  keyhiveSyncServer: SyncServerSelection
+): Promise<{ repo: Repo; hive: AutomergeRepoKeyhive }> {
+  const { initKeyhiveWasm, initializeAutomergeRepoKeyhive } =
+    await import("@automerge/automerge-repo-keyhive");
+  initKeyhiveWasm();
+  const remote = resolverRemote();
+  const { hive, repo } = await initializeAutomergeRepoKeyhive({
+    // ARK injects an `idFactory` deriving document ids from keyhive. A site
+    // can opt out of it with `keyhive: { useIdFactory: false }`.
+    createRepo: ({ idFactory, ...config }) =>
+      relayKeyhive(
+        new Repo(
+          syncServer.useIdFactory === false ? config : { ...config, idFactory }
+        ),
+        remote
+      ),
+    storage: new IndexedDBStorageAdapter(keyhiveStorageName),
+    peerIdSuffix:
+      `${storagePrefix}-resolver` + Math.random().toString(36).slice(2),
+    automaticArchiveIngestion: true,
+    cachingMode: "periodic",
+    // ARK selects the relay via `syncServer`, which pairs the contact card with
+    // the matching peer id. Omitting it defaults to "subduction".
+    syncServer: keyhiveSyncServer,
+    repo: {
+      storage: new IndexedDBStorageAdapter(),
+      subductionRemote: remote,
+      headsChannel: `${storagePrefix}-heads`,
+      enableRemoteHeadsGossiping: true,
+    },
+  });
+
+  hive.networkAdapter.whenReady().then(() => {
+    (hive.networkAdapter as any).syncKeyhive();
+  });
+
+  return { repo, hive };
+}
+
+// ── Classic sync ───────────────────────────────────────────────────────
+
+let classicSyncServer = DEFAULT_CLASSIC_SYNC_SERVER;
+let classicSyncAdapter: WebSocketWorkerClientAdapter | null = null;
+let classicSyncConnect: Promise<void> | null = null;
+
+function connectClassicSyncNetwork(server: string): Promise<void> {
+  const url = server.trim() || DEFAULT_CLASSIC_SYNC_SERVER;
+  if (classicSyncConnect && classicSyncServer === url)
+    return classicSyncConnect;
+
+  if (classicSyncAdapter && classicSyncServer !== url) {
+    classicSyncAdapter.disconnect();
+    classicSyncAdapter = null;
+  }
+
+  classicSyncServer = url;
+  const connecting = (async () => {
+    const repo = await getRepo();
+    if (!classicSyncAdapter) {
+      classicSyncAdapter = new WebSocketWorkerClientAdapter(url);
+      repo.networkSubsystem.addNetworkAdapter(classicSyncAdapter);
+    }
+    await classicSyncAdapter.whenReady();
+    log("classic sync connected", url);
+  })();
+
+  // Clear the memo on failure so a later attempt can retry, and swallow the
+  // rejection on this copy so it isn't reported as unhandled — callers get it
+  // from the promise we return.
+  classicSyncConnect = connecting;
+  connecting.catch(() => {
+    if (classicSyncConnect === connecting) classicSyncConnect = null;
+  });
+  return connecting;
+}
+
+// ── Control protocol ───────────────────────────────────────────────────
+
+function handleControlMessage(
+  data: any,
+  controlPort: MessagePort,
+  event: MessageEvent
+): void {
+  if (data?.type === "sync-connect") {
+    const [port] = event.ports;
+    if (port) connectToSyncNode(port);
+    return;
+  }
+  if (data?.type !== "connect-classic-sync") return;
+  const [replyPort] = event.ports;
+  const server =
+    typeof data.server === "string" ? data.server : DEFAULT_CLASSIC_SYNC_SERVER;
+  connectClassicSyncNetwork(server).then(
+    () => {
+      replyPort?.postMessage({ type: "connect-classic-sync-ready" });
+      replyPort?.close();
+    },
+    (err) => {
+      console.error("connectClassicSyncNetwork failed", err);
+      replyPort?.postMessage({
+        type: "connect-classic-sync-failed",
+        error: String(err),
+      });
+      replyPort?.close();
+    }
+  );
+}
+
+// ── Resolving ──────────────────────────────────────────────────────────
+
+function waitForHeads(
+  handle: DocHandle<unknown>,
+  hexHeads: string[],
+  signal: AbortSignal
+): Promise<boolean> {
+  if (hasHeads(handle.doc(), hexHeads)) return Promise.resolve(true);
+  if (signal.aborted) return Promise.resolve(false);
+  return new Promise((resolve) => {
+    const cleanup = () => {
+      handle.off("heads-changed", check);
+      signal.removeEventListener("abort", onAbort);
+    };
+    const check = () => {
+      if (!hasHeads(handle.doc(), hexHeads)) return;
+      cleanup();
+      resolve(true);
+    };
+    const onAbort = () => {
+      cleanup();
+      resolve(false);
+    };
+    handle.on("heads-changed", check);
+    signal.addEventListener("abort", onAbort);
+    // The heads may have landed between the check above and subscribing.
+    check();
+  });
+}
+
+const CATCH_UP_MS = 3_000;
+
+async function caughtUpWithPeers(
+  repo: Repo,
+  handle: DocHandle<unknown>,
+  signal: AbortSignal
+): Promise<void> {
+  if (!repo.isSubductionConnected()) return;
+  const peers = (await repo.connectedSubductionPeerIds()) as StorageId[];
+  const caughtUp = () => {
+    const states = peers.map((peer) => handle.isCaughtUpWith(peer));
+    return (
+      states.some((state) => state !== undefined) && !states.includes(false)
+    );
+  };
+  if (caughtUp() || signal.aborted) return;
+  await new Promise<void>((resolve) => {
+    const done = () => {
+      clearTimeout(timer);
+      handle.off("remote-heads", check);
+      handle.off("heads-changed", check);
+      signal.removeEventListener("abort", done);
+      resolve();
+    };
+    const check = () => {
+      if (caughtUp()) done();
+    };
+    const timer = setTimeout(done, CATCH_UP_MS);
+    handle.on("remote-heads", check);
+    handle.on("heads-changed", check);
+    signal.addEventListener("abort", done);
+    if (signal.aborted) done();
+    else check();
+  });
+}
+
+/**
+ * Thrown instead of returning a Response when the request should fail as a
+ * network error rather than resolve to something the caller can memoize.
+ * See {@link HandoffAbortMessage}.
+ */
+class AbortHandoff extends Error {}
+
+async function resolveAutomergeUrl(
+  automergeURL: URL,
+  signal: AbortSignal
+): Promise<Response> {
+  const repo = await getRepo();
+  const [maybeAutomergeUrl, ...path] = automergeURL.href.split("/");
+
+  if (!isValidAutomergeUrl(maybeAutomergeUrl)) {
+    return new Response("invalid automerge url", { status: 400 });
+  }
+
+  if (path.length && !path[path.length - 1]) path.pop();
+
+  const { heads, hexHeads, documentId } = parseAutomergeUrl(maybeAutomergeUrl);
+
+  // todo, maybe a bad idea? maybe we should throw instead of es-module-caching
+  // the headless req
+  if (!heads) {
+    let folder = await repo.find(maybeAutomergeUrl, { signal });
+    await caughtUpWithPeers(repo, folder, signal);
+    // Packages used to be published as a branches doc, which stands for its
+    // default branch. The tab's ModuleWatcher looks packages up through here,
+    // so this is where that's followed.
+    const branch = getDefaultBranch(folder.doc());
+    if (branch) {
+      folder = await repo.find(branch, { signal });
+      await caughtUpWithPeers(repo, folder, signal);
+    }
+    const url = stringifyAutomergeUrl({
+      documentId: folder.documentId,
+      heads: folder.heads(),
+    });
+    const location = `/${encodeURIComponent(url)}${path.length ? `/${path.join("/")}` : ""}`;
+    return Response.redirect(location, 307);
+  }
+
+  const baseHandle = await repo.find(stringifyAutomergeUrl({ documentId }), {
+    signal,
+  });
+  if (!(await waitForHeads(baseHandle, hexHeads ?? [], signal))) {
+    throw new AbortHandoff(
+      `heads not found for ${maybeAutomergeUrl} within ${RESOLVE_TIMEOUT_MS}ms`
+    );
+  }
+
+  const resolved = await resolvePath(
+    repo,
+    baseHandle.view(heads),
+    path.map(decodeURIComponent)
+  );
+  if (!resolved) {
+    throw new Error(
+      `couldn't resolve ${path.join("/")} in folder at ${maybeAutomergeUrl}`
+    );
+  }
+
+  const body: BodyInit =
+    resolved.content instanceof Uint8Array
+      ? (new Uint8Array(resolved.content) as BlobPart)
+      : resolved.content;
+
+  return new Response(body, {
+    status: 200,
+    headers: {
+      "content-type": resolved.type,
+      "cache-control": resolved.pinned
+        ? "public, max-age=31536000, immutable"
+        : "no-store",
+    },
+  });
+}
+
+const handoffChannel = new BroadcastChannel(HANDOFF_CHANNEL);
+
+function replyToHandoff(id: string, status: number, body: string): void {
+  handoffChannel.postMessage({
+    id,
+    type: "response",
+    response: { status, body, headers: { "content-type": "text/plain" } },
+  } satisfies HandoffResponseMessage);
+}
+
+function impatience(limit: number) {
+  return new Promise<never>((_, reject) =>
+    setTimeout(
+      () => reject(new Error(`resolve timeout after ${limit}ms`)),
+      limit
+    )
+  );
+}
+
+const EVICT_IDLE_MS = 5_000;
+let handoffsInFlight = 0;
+let evictTimer: ReturnType<typeof setTimeout> | undefined;
+
+function handoffStarted() {
+  handoffsInFlight++;
+  clearTimeout(evictTimer);
+}
+
+function handoffFinished() {
+  if (--handoffsInFlight > 0) return;
+  clearTimeout(evictTimer);
+  evictTimer = setTimeout(() => {
+    evictLoaded().catch((error) => console.error("eviction failed", error));
+  }, EVICT_IDLE_MS);
+}
+
+async function evictLoaded() {
+  const repo = await repoPromise?.catch(() => null);
+  if (!repo) return;
+  const ids = Object.keys(repo.handles) as DocumentId[];
+  log(
+    `evicting ${ids.length} document(s) after ${EVICT_IDLE_MS}ms without a handoff`
+  );
+  for (const id of ids) {
+    if (handoffsInFlight > 0) return;
+    await repo.removeFromCache(id);
+  }
+}
+
+async function handleHandoffRequest(message: HandoffRequestMessage) {
+  const { id, request } = message;
+
+  let handoff: URL;
+  try {
+    handoff = new URL(request.handoffURL);
+  } catch {
+    console.error("couldn't parse handoff url", request);
+    replyToHandoff(
+      id,
+      400,
+      `couldn't parse a special url out of ${request.url}`
+    );
+    return;
+  }
+
+  // Other handlers may be listening on the channel for other schemes, so stay
+  // quiet rather than clobbering their reply with an error.
+  if (handoff.protocol !== "automerge:") {
+    log(
+      `ignoring handoff ${id} for non-automerge url ${handoff}. not my circus, not my monkeys`
+    );
+    return;
+  }
+
+  handoffStarted();
+  try {
+    await respondToHandoff(message, handoff);
+  } finally {
+    handoffFinished();
+  }
+}
+
+async function respondToHandoff(message: HandoffRequestMessage, handoff: URL) {
+  const { id, cachename, request } = message;
+
+  let response: Response;
+  try {
+    log(`resolving handoff ${id} for ${handoff}`);
+    const signal = AbortSignal.timeout(RESOLVE_TIMEOUT_MS);
+    response = await Promise.race([
+      resolveAutomergeUrl(handoff, signal),
+      impatience(RESOLVE_TIMEOUT_MS),
+    ]);
+  } catch (error) {
+    if (error instanceof AbortHandoff) {
+      handoffChannel.postMessage({
+        id,
+        type: "abort",
+        reason: error.message,
+      } satisfies HandoffAbortMessage);
+      return;
+    }
+    console.error(`error resolving ${request.url}`, error);
+    replyToHandoff(
+      id,
+      557,
+      error instanceof Error
+        ? `${error.message}\n\n${error.stack}`
+        : String(error)
+    );
+    return;
+  }
+
+  try {
+    const immutable =
+      CACHEABLE_STATUSES.includes(response.status) &&
+      !/(^|,)\s*no-store(\s*,|$)/.test(
+        response.headers.get("cache-control") ?? ""
+      );
+    if (!immutable) {
+      // Errors, redirects and the like go back inline for the service worker to
+      // serve directly. Mutable responses aren't cached because the same URL
+      // can resolve to different content later.
+      log(`responding inline to ${request.url} with ${response.status}`);
+      handoffChannel.postMessage({
+        id,
+        type: "response",
+        response: {
+          status: response.status,
+          headers: Object.fromEntries(response.headers.entries()),
+          body: response.body
+            ? new Uint8Array(await response.arrayBuffer())
+            : undefined,
+        },
+      } satisfies HandoffResponseMessage);
+      return;
+    }
+
+    // Reconstruct the request the service worker is holding so the entry matches
+    // its cache.match. `destination` isn't constructible but doesn't participate
+    // in cache matching.
+    const cacheKey = new Request(request.url, {
+      method: request.method,
+      headers: request.headers,
+      referrer: request.referrer,
+    });
+    const cache = await caches.open(cachename);
+    await cache.put(cacheKey, response);
+    log(`cached ${cacheKey.url} in ${cachename}`);
+    handoffChannel.postMessage({
+      id,
+      type: "cached",
+    } satisfies HandoffCachedMessage);
+  } catch (error) {
+    console.error(`failed to reply for ${request.url}`, error);
+    replyToHandoff(id, 558, String(error));
+  }
+}
+
+// How long a restart waits for in-flight handoffs before closing anyway.
+const DRAIN_HANDOFFS_MS = 3_000;
+let draining = false;
+
+// Stop taking new handoffs and let the ones in flight finish. The service
+// worker keeps every unanswered handoff pending and re-broadcasts them when
+// our replacement announces itself online, so nothing dropped here is lost —
+// waiting is a courtesy to requests that are nearly done, not a requirement.
+async function drainForRestart(): Promise<void> {
+  draining = true;
+  const deadline = Date.now() + DRAIN_HANDOFFS_MS;
+  while (handoffsInFlight > 0 && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  if (handoffsInFlight > 0) {
+    console.warn(
+      `[lifecycle] closing with ${handoffsInFlight} handoff(s) in flight; the service worker will re-send them`
+    );
+  }
+  const repo = await repoPromise?.catch(() => null);
+  await repo?.flush();
+  const node = await syncNodePromise?.catch(() => null);
+  await node?.shutdown();
+}
+
+handoffChannel.addEventListener("message", (event) => {
+  if (event.data?.type !== "request") return;
+  if (draining) {
+    log(`ignoring handoff ${event.data.id} while restarting`);
+    return;
+  }
+  void handleHandoffRequest(event.data as HandoffRequestMessage);
+});
+
+// Announce ourselves so the service worker can re-broadcast handoff requests
+// sent while we were booting.
+handoffChannel.postMessage({ type: "online" } satisfies HandoffOnlineMessage);

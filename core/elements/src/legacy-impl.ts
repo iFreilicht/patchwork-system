@@ -1,9 +1,10 @@
 import {
+  parseAutomergeUrl,
   type AutomergeUrl,
   type DocHandle,
   type DocHandleChangePayload,
   type Repo,
-} from "@automerge/automerge-repo";
+} from "@automerge/automerge-repo/slim";
 import {
   getSuggestedImportUrl,
   getType,
@@ -13,6 +14,7 @@ import {
 import {
   getFallbackTool,
   getRegistry,
+  isKeyhiveDoc,
   isLoadablePlugin,
   registerPlugins,
   type LoadedTool,
@@ -20,10 +22,7 @@ import {
   type ToolElement,
 } from "@inkandswitch/patchwork-plugins";
 import debug from "debug";
-import {
-  docIdFromAutomergeUrl,
-  type initializeAutomergeRepoKeyhive,
-} from "@automerge/automerge-repo-keyhive";
+import type { AutomergeRepoKeyhiveBase as AutomergeRepoKeyhive } from "@automerge/automerge-repo-keyhive";
 import { MountedEvent, UnmountedEvent } from "./events.js";
 
 const log = debug("patchwork:elements:legacy");
@@ -41,10 +40,6 @@ function isWildcardOnlyMatch(
   const list = datatypes === "*" ? ["*"] : datatypes;
   return list.includes("*") && (type === undefined || !list.includes(type));
 }
-
-type AutomergeRepoKeyhive = Awaited<
-  ReturnType<typeof initializeAutomergeRepoKeyhive>
->;
 
 const State = {
   none: "none",
@@ -138,7 +133,7 @@ function ensureErrorStyles() {
       font-family: var(--studio-family, system-ui, sans-serif);
       font-size: 0.85rem;
       line-height: 1.5;
-      color: var(--studio-text, #1a1a1a);
+      color: var(--studio-line, #1a1a1a);
     }
     .pw-error__actions {
       display: flex;
@@ -154,7 +149,7 @@ function ensureErrorStyles() {
       font-family: var(--studio-family, system-ui, sans-serif);
       font-size: 0.8rem;
       line-height: 1;
-      color: var(--studio-text, #1a1a1a);
+      color: var(--studio-line, #1a1a1a);
       background: var(--studio-fill, white);
       border: 1px solid var(--studio-fill-offset-30, rgba(0, 0, 0, 0.12));
       border-radius: var(--studio-radius-md, 8px);
@@ -326,15 +321,8 @@ export class LegacyImpl {
     this.#state = State.initializing;
 
     if (this.#element.hive && this.#docUrl) {
-      let isKeyhiveDoc = false;
-      try {
-        docIdFromAutomergeUrl(this.#docUrl);
-        isKeyhiveDoc = true;
-      } catch {
-        // Legacy (padded-zero) doc: skip keyhive gate
-      }
-
-      if (isKeyhiveDoc) {
+      // Legacy (padded-zero) doc: skip keyhive gate
+      if (isKeyhiveDoc(this.#docUrl)) {
         const bestAccess = await this.#element.hive.bestAccessForDoc(
           this.#element.hive.active.individual.id,
           this.#docUrl
@@ -545,7 +533,7 @@ export class LegacyImpl {
 
     retryingDocs.add(this.#docUrl);
     try {
-      const documentId = String(docIdFromAutomergeUrl(this.#docUrl));
+      const { documentId } = parseAutomergeUrl(this.#docUrl);
       const handle = (this.#element.repo.handles as any)[documentId];
       if (handle && handle.state === "unavailable") {
         this.#element.repo.delete(this.#docUrl);
@@ -570,7 +558,7 @@ export class LegacyImpl {
       let hasAccess = false;
       let accessCheckSucceeded = false;
       try {
-        docIdFromAutomergeUrl(this.#docUrl);
+        if (!isKeyhiveDoc(this.#docUrl)) return;
         const bestAccess = await this.#element.hive.bestAccessForDoc(
           this.#element.hive.active.individual.id,
           this.#docUrl
@@ -626,7 +614,7 @@ export class LegacyImpl {
 
     // A wildcard fallback tool (`supportedDatatypes: ["*"]`) supports this doc
     // only generically, not because it's built for the doc's datatype — it's a
-    // stopgap we render while we try to load something better.
+    // stopgap, so it gives way to anything the doc suggests we load instead.
     const mountingWildcardStopgap =
       fallingBack &&
       !!fallbackTool &&
@@ -634,19 +622,26 @@ export class LegacyImpl {
 
     if (fallingBack) {
       console.warn(`falling back to default tool for ${this.#docUrl}`);
-      // For a wildcard stopgap, also offer the doc's suggested import so a
-      // datatype-specific tool can load, at which point the registry listeners
-      // above swap it in (it sorts ahead of the wildcard as the new fallback).
-      // We still render the wildcard tool in the meantime, so the offer goes in
-      // a toast rather than replacing what's mounted.
+      // A wildcard stopgap is a raw viewer, not this datatype's editor. When the
+      // doc names a package that would bring the real thing, offer that instead
+      // of mounting the stopgap: raw JSON isn't what was asked for, and it would
+      // only be swapped out from under the reader once the import lands. Parking
+      // in `unable` is what lets the registry listeners re-render then — the
+      // loaded tool sorts ahead of the wildcard as the new fallback.
       if (mountingWildcardStopgap) {
         const suggestion = this.#suggestedImport();
-        if (suggestion && !suggestion.loading) {
-          this.#showToast(
-            "This document suggests a package",
-            suggestion.url,
-            () => this.#loadSuggestedImport(suggestion.url)
-          );
+        if (suggestion) {
+          this.#state = State.unable;
+          // While the import is in flight `#loadSuggestedImport`'s progress
+          // toast is already up, and `#resetDisplay` leaves it alone.
+          if (!suggestion.loading) {
+            this.#showToast(
+              "This document suggests a package",
+              suggestion.url,
+              () => this.#loadSuggestedImport(suggestion.url)
+            );
+          }
+          return;
         }
       }
     }
@@ -719,10 +714,10 @@ export class LegacyImpl {
       } else {
         console.warn(`return a cleanup function from ${toolId}`);
       }
-      // Mounting a datatype-specific tool (or an explicitly chosen one) means an
-      // editor was found, so retire the "loading suggested import" toast. A
-      // wildcard stopgap keeps it up — we're still waiting on the real tool.
-      if (!mountingWildcardStopgap) this.#dismissToast();
+      // Something mounted, so retire any "loading suggested import" toast. A
+      // wildcard stopgap only gets this far when the doc suggests nothing, so
+      // there's no offer left standing either way.
+      this.#dismissToast();
       this.#state = fallingBack ? "fallback" : "rendered";
       this.#element.dispatchEvent(
         new MountedEvent({ url: this.#docUrl, toolId })
@@ -987,12 +982,16 @@ export class LegacyImpl {
       display: "flex",
       gap: "10px",
       padding: "12px 14px",
-      borderRadius: "6px",
-      background: "#eaf1fb",
-      color: "#1a1a1a",
-      borderLeft: "4px solid #1e5fbf",
-      boxShadow: "0 6px 20px rgba(0, 0, 0, 0.18)",
-      font: "13px/1.4 -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif",
+      borderRadius: "var(--studio-radius, 6px)",
+      // Themed surface, faintly tinted by the accent: a hardcoded light card
+      // would hold a dark-themed button (they share `--studio-*`) and read as
+      // black-on-black in a dark theme.
+      background:
+        "color-mix(in oklch, var(--studio-fill, #eaf1fb), var(--studio-primary, #1e5fbf) 8%)",
+      color: "var(--studio-line, #1a1a1a)",
+      borderLeft: "4px solid var(--studio-primary, #1e5fbf)",
+      boxShadow: "var(--studio-shadow-lg, 0 6px 20px rgba(0, 0, 0, 0.18))",
+      font: "13px/1.4 var(--studio-family, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif)",
       opacity: "0",
       transition: "opacity 0.25s ease",
       pointerEvents: action ? "auto" : "none",
@@ -1005,7 +1004,7 @@ export class LegacyImpl {
       height: "8px",
       marginTop: "4px",
       borderRadius: "50%",
-      background: "#1e5fbf",
+      background: "var(--studio-primary, #1e5fbf)",
     });
     if (!action) {
       dot.animate(
@@ -1121,6 +1120,7 @@ export class LegacyImpl {
 
   async #importSuggestedModule(url: string): Promise<void> {
     log("importing suggested module", url);
+    const epoch = this.#initEpoch;
     try {
       // A `suggestedImportUrl` can be an `automerge:` folder doc served through
       // the service worker as well as a plain HTTP(S) module bundle.
@@ -1129,10 +1129,30 @@ export class LegacyImpl {
         registerPlugins(mod.plugins, url);
       } else {
         console.warn(`suggested module ${url} has no plugins array`);
+        this.#reportImportFailed(epoch, url);
       }
     } catch (error) {
       console.error(`Failed to import suggested module ${url}`, error);
+      this.#reportImportFailed(epoch, url, error);
     }
+  }
+
+  /**
+   * The import registered nothing, so the view it was going to fill has nothing
+   * coming: say so rather than sit empty once the progress toast times out.
+   * Only called where nothing could have been registered, so no render is in
+   * flight, and only acts while this view still has nothing mounted.
+   */
+  #reportImportFailed(epoch: number, url: string, error?: unknown): void {
+    if (epoch !== this.#initEpoch) return;
+    if (this.#state !== State.unable) return;
+    this.#dismissToast(true);
+    const err = error as Error | undefined;
+    this.#displayError(
+      `I couldn't load the package at ${url}.`,
+      err?.stack ?? err?.message,
+      error
+    );
   }
 
   #resetDisplay = () => {

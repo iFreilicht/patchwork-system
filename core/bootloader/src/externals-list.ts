@@ -6,11 +6,7 @@ const externals = [
   "@automerge/automerge/slim",
   "@automerge/automerge-repo",
   "@automerge/automerge-repo/slim",
-  // Port-donation plumbing for WorkerWebSocketEndpoint: tabs spawn the shared
-  // proxy entry and donate its port to the automerge worker (Chrome can't
-  // spawn workers from inside a SharedWorker). See setup.ts/automerge-worker.ts.
-  "@automerge/automerge-repo/worker-port",
-  "@automerge/automerge-repo/subduction-websocket-worker-shared",
+  "@automerge/automerge-repo-network-broadcastchannel",
   "@automerge/automerge-repo-network-messagechannel",
   "@automerge/automerge-repo-network-websocket",
   "@automerge/automerge-repo-storage-indexeddb",
@@ -41,3 +37,10 @@ const externals = [
   "solid-js/jsx-runtime",
 ];
 export default externals;
+
+export const slim: Record<string, string> = {
+  "@automerge/automerge": "@automerge/automerge/slim",
+  "@automerge/automerge-repo": "@automerge/automerge-repo/slim",
+  "@automerge/automerge-subduction": "@automerge/automerge-subduction/slim",
+  "@keyhive/keyhive": "@keyhive/keyhive/slim",
+};
