@@ -7,6 +7,7 @@ import {
   Repo,
   generateAutomergeUrl,
   type AutomergeUrl,
+  type DocHandle,
   type PeerId,
 } from "@automerge/automerge-repo";
 import {
@@ -494,5 +495,54 @@ describe("watching a document", () => {
       doc.count = 1;
     });
     await eventually(() => heard.changes > before);
+  });
+});
+
+describe("ephemeral messages", () => {
+  /**
+   * Broadcast on `from` until `to` hears it. Subscribing reaches the server
+   * a moment after a handle opens, and what's sent before then is lost.
+   */
+  async function hears(from: DocHandle<Doc>, to: DocHandle<Doc>) {
+    const received: unknown[] = [];
+    to.on("ephemeral-message", ({ message }) => received.push(message));
+    const pump = setInterval(() => from.broadcast({ hello: "there" }), 50);
+    try {
+      await eventually(() => received.length > 0);
+    } finally {
+      clearInterval(pump);
+    }
+    expect(received[0]).toEqual({ hello: "there" });
+  }
+
+  it("delivers another peer's ephemeral messages to a tab", async () => {
+    const server = startServer();
+    const other = elsewhere(server);
+    const theirs = other.create<Doc>({ count: 0 });
+    await other.flush();
+
+    const ours = await origin(server).tab().find<Doc>(theirs.url);
+    await hears(theirs, ours);
+  });
+
+  it("delivers a tab's ephemeral messages to another peer", async () => {
+    const server = startServer();
+    const tab = origin(server).tab();
+    const ours = tab.create<Doc>({ count: 0 });
+    await tab.flush();
+
+    const theirs = await elsewhere(server).find<Doc>(ours.url);
+    await hears(ours, theirs);
+  });
+
+  it("carries one tab's ephemeral messages to another tab", async () => {
+    const server = startServer();
+    const site = origin(server);
+    const a = site.tab();
+    const inA = a.create<Doc>({ count: 0 });
+    await a.flush();
+    const inB = await site.tab().find<Doc>(inA.url);
+
+    await hears(inA, inB);
   });
 });
