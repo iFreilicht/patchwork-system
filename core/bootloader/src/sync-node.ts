@@ -162,11 +162,14 @@ export class SyncNode {
         });
       },
       onEphemeral: (
-        id: SedimentreeId,
+        id: Topic,
         sender: { toString(): string },
         payload: Uint8Array
       ) => {
-        const sid = id.toString();
+        // Topic.toString() returns an abbreviated hex ("3449915b…"); the sid
+        // it was subscribed under is the full hex of the sedimentree id with
+        // the exact same bytes.
+        const sid = SedimentreeId.fromBytes(id.toBytes()).toString();
         const message: NodeMessage = {
           type: "ephemeral",
           sid,
