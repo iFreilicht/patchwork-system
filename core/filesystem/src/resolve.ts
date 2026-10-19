@@ -1,4 +1,5 @@
 import {
+  type AutomergeUrl,
   type DocHandle,
   type Repo,
   isImmutableString,
@@ -11,6 +12,16 @@ export type Resolved = {
   content: string | Uint8Array;
   type: string;
 };
+
+/**
+ * `value` as a link, if it is one. A link written as an `ImmutableString`
+ * (one op, where a plain string is an op per character) reads back as an
+ * object, not a string; it's the same url.
+ */
+function asLink(value: unknown): AutomergeUrl | undefined {
+  const url = isImmutableString(value) ? String(value) : value;
+  return typeof url === "string" && isValidAutomergeUrl(url) ? url : undefined;
+}
 
 export interface FolderStrategy {
   matches(doc: unknown): boolean;
@@ -36,10 +47,11 @@ const folderStrategy: FolderStrategy = {
     if (!folder?.docs) return undefined;
 
     const part = parts[0];
-    const docLink = folder.docs.find((doc) => doc.name === part);
-    if (!docLink) return undefined;
+    const docLink = folder.docs.find((doc) => String(doc.name) === part);
+    const url = asLink(docLink?.url);
+    if (!url) return undefined;
 
-    const next = await repo.find(docLink.url);
+    const next = await repo.find(url);
     return resolvePathInternal(repo, next, parts.slice(1), visited);
   },
 };
@@ -59,13 +71,14 @@ async function walkDirectoryDoc(
   parts: string[],
   visited: Set<string>
 ): Promise<Resolved | undefined> {
-  if (typeof node === "string" && isValidAutomergeUrl(node)) {
+  const link = asLink(node);
+  if (link) {
     // Following a url consumes no parts, so revisiting the same url with the
     // same remaining parts is a cycle.
-    const key = `${node}|${parts.join("/")}`;
+    const key = `${link}|${parts.join("/")}`;
     if (visited.has(key)) return undefined;
     visited.add(key);
-    const next = await repo.find(node);
+    const next = await repo.find(link);
     return resolvePathInternal(repo, next, parts, visited);
   }
 
@@ -98,10 +111,11 @@ async function materialize(
   typeHint?: string,
   visited: Set<string> = new Set()
 ): Promise<Resolved | undefined> {
-  if (typeof node === "string" && isValidAutomergeUrl(node)) {
-    if (visited.has(node)) return undefined;
-    visited.add(node);
-    const next = await repo.find(node);
+  const link = asLink(node);
+  if (link) {
+    if (visited.has(link)) return undefined;
+    visited.add(link);
+    const next = await repo.find(link);
     return materialize(repo, next.doc(), typeHint, visited);
   }
 
