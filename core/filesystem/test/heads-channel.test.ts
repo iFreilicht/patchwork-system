@@ -12,7 +12,7 @@ import {
   type StorageId,
   type StorageKey,
 } from "@automerge/automerge-repo";
-import { MemorySigner, SedimentreeId } from "@automerge/automerge-subduction";
+import { CommitId, MemorySigner, SedimentreeId } from "@automerge/automerge-subduction";
 
 interface Doc {
   text: string;
@@ -154,18 +154,53 @@ const offlineWithin = (healInitialDelayMs: number): Partial<RepoConfig> => ({
   subductionTimeouts: { healInitialDelayMs },
 });
 
-/** The commit heads this repo's subduction tree actually holds. */
+/**
+ * The commit heads this repo's subduction tree actually holds: loose, or at
+ * the head of a fragment, which is where a commit whose hash starts with a
+ * zero byte goes (about one in 256).
+ */
 async function treeCommits(repo: Repo, documentId: DocumentId) {
   const bytes = new Uint8Array(32);
   bytes.set(documentIdToBinary(documentId)!.subarray(0, 32));
-  const commits = await (
-    await repo.subduction
-  ).getCommits(SedimentreeId.fromBytes(bytes));
-  return (commits ?? []).map((c) => c.commitId.toHexString());
+  const subduction = await repo.subduction;
+  const sid = SedimentreeId.fromBytes(bytes);
+  const commits = (await subduction.getCommits(sid)) ?? [];
+  const fragments = (await subduction.getFragments(sid)) ?? [];
+  return [
+    ...commits.map((c) => c.commitId.toHexString()),
+    ...fragments.map((f) => f.head.toHexString()),
+  ];
 }
 
+/** Writes of a commit, loose or as a fragment. */
+const isCommitKey = (k: string) => /^subduction\/(commits|fragments)\//.test(k);
+
 const commitWrites = (storage: SharedMemoryAdapter, from: number) =>
-  storage.writes.slice(from).filter((k) => k.startsWith("subduction/commits/"));
+  storage.writes.slice(from).filter(isCommitKey);
+
+/**
+ * Make `fn` as a change on `handle` that lands loose or as a fragment, as
+ * asked, rather than as the hash happens to fall. Trial changes on a clone
+ * with the same actor find a message whose hash has the wanted depth.
+ */
+async function changeLanding(
+  repo: Repo,
+  handle: { doc(): Doc; change(fn: (d: Doc) => void, opts?: Automerge.ChangeOptions<Doc>): void },
+  fn: (d: Doc) => void,
+  asFragment: boolean
+) {
+  const subduction = await repo.subduction;
+  for (let i = 0; ; i++) {
+    const opts = { message: `try ${i}`, time: 0 };
+    const doc = handle.doc();
+    const trial = Automerge.change(Automerge.clone(doc, Automerge.getActorId(doc)), opts, fn);
+    const head = Automerge.getHeads(trial)[0];
+    if (subduction.commitDepth(CommitId.fromHexString(head)).isBoundary === asFragment) {
+      handle.change(fn, opts);
+      return head;
+    }
+  }
+}
 
 const repos: Repo[] = [];
 afterEach(async () => {
@@ -566,8 +601,11 @@ describe("subduction heads channel", () => {
     expect(commitWrites(storageA, writeMark)).toEqual([]);
   });
 
-  it("offline, a sibling's commit is written again so this tab can push it", async () => {
-    const { storageA, storageB, repoA, syncA, a, b } = await shared(
+  it.each([
+    ["loose", false],
+    ["as a fragment", true],
+  ])("offline, a sibling's commit (%s) is written again so this tab can push it", async (kind, asFragment) => {
+    const { storageA, storageB, repoA, repoB, syncA, a, b } = await shared(
       channelName(),
       offlineWithin(300)
     );
@@ -575,13 +613,13 @@ describe("subduction heads channel", () => {
     const rounds = syncA.mock.calls.length;
     const writeMark = storageA.writes.length;
 
-    b.change((d) => {
+    const hash = await changeLanding(repoB, b, (d) => {
       d.text = "from b";
-    });
+    }, asFragment);
     await until(() => a.doc().text === "from b", 5000, "A sees B's change");
-    const hash = Automerge.getHeads(b.doc())[0];
-    const bCommit = `subduction/commits/${sid}/${hash}`;
-    expect(storageB.writes).toContain(bCommit);
+    expect(Automerge.getHeads(b.doc())).toEqual([hash]);
+    const bCommit = `subduction/${asFragment ? "fragments" : "commits"}/${sid}/${hash}`;
+    expect(storageB.writes, kind).toContain(bCommit);
 
     // The reload put B's commit in A's handle and in A's knownHashes, but
     // not in A's tree: as it stands A can never push it.
