@@ -67,7 +67,19 @@ test("a counter tool installed from an automerge url can be created and clicked"
     if ((await installedCount.textContent()) === "0") {
       await page.keyboard.press("Escape");
       await search.fill("");
-      await search.fill(packageUrl);
+      // Only a paste opens the install modal (typing a URL just filters by
+      // it), and fill() fires input, not paste, so dispatch one ourselves.
+      await search.evaluate((el, text) => {
+        const clipboardData = new DataTransfer();
+        clipboardData.setData("text/plain", text);
+        el.dispatchEvent(
+          new ClipboardEvent("paste", {
+            clipboardData,
+            bubbles: true,
+            cancelable: true,
+          }),
+        );
+      }, packageUrl);
       await expect(install.locator(".pw-install__card")).toBeVisible({
         timeout: 10_000,
       });
