@@ -14,19 +14,29 @@ import {
  * in-memory Repo is gone — the doc must still be retrievable, proving the
  * persistence layer works without any network.
  */
-test("a doc survives a page reload via IndexedDB", async ({ page }) => {
+test("a doc survives a page reload via IndexedDB", async ({
+  context,
+  page,
+}) => {
   await page.goto("/");
   await waitForServiceWorkerActive(page);
   await waitForRepoReady(page);
 
   const url = await createDoc(page, { note: "persist-me" });
 
-  // Give the SW a beat to receive + persist the doc before reloading.
+  // Confirm the SW has the doc before reloading. Asking `page` proves
+  // nothing (its own Repo answers from memory), so ask a tab that never
+  // had it: otherwise the reload can tear down the relay mid-sync and the
+  // doc is lost before it reaches the SW.
+  const probe = await context.newPage();
+  await probe.goto("/");
+  await waitForRepoReady(probe);
   await expect
-    .poll(async () => findDocField<string>(page, url, "note"), {
+    .poll(async () => findDocField<string>(probe, url, "note"), {
       timeout: 15_000,
     })
     .toBe("persist-me");
+  await probe.close();
 
   await page.reload();
   await waitForRepoReady(page);
