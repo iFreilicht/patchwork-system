@@ -110,8 +110,10 @@ const succeededRound = async () => ({
 
 const channelName = () => `test-heads-${Math.random().toString(36).slice(2)}`;
 
+// From the id marker every save writes: the first change can go straight into
+// a fragment (when its hash starts with a zero byte), with no loose commit.
 const sidOf = (storage: SharedMemoryAdapter) =>
-  storage.writes.find((k) => k.startsWith("subduction/commits/"))!.split("/")[2];
+  storage.writes.find((k) => k.startsWith("subduction/ids/"))!.split("/")[2];
 
 const SERVER = "server" as StorageId;
 const MAX_BACKSTOP_SYNCS = 3;
