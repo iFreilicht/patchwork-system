@@ -29,16 +29,25 @@ export function textSplices(
 ): TextSplice[] {
   const out: TextSplice[] = [];
   for (const patch of patches) {
-    if (patch.action !== "splice" && patch.action !== "del") continue;
+    const { action } = patch;
+    if (action !== "splice" && action !== "del" && action !== "insert")
+      continue;
     const index = patch.path[patch.path.length - 1];
     if (typeof index !== "number") continue;
     const parent = patch.path.slice(0, -1);
-    if (patch.action === "del" && !isText(parent)) continue;
+    // Splices are always text; deletions and insertions (rich text's block
+    // markers are objects inserted into it) only count in a text.
+    if (action !== "splice" && !isText(parent)) continue;
     out.push({
       key: pathKey(parent),
       index,
-      remove: patch.action === "del" ? (patch.length ?? 1) : 0,
-      insert: patch.action === "splice" ? patch.value.length : 0,
+      remove: action === "del" ? (patch.length ?? 1) : 0,
+      insert:
+        action === "splice"
+          ? patch.value.length
+          : action === "insert"
+            ? patch.values.length
+            : 0,
     });
   }
   return out;

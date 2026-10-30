@@ -25,3 +25,4 @@ export {
   type UndoStatus,
 } from "./protocol.js";
 export { backingOf, rootOf, type HandleIndex } from "./handles.js";
+export { UNDO_MARKER } from "./marker.js";

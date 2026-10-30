@@ -14,6 +14,7 @@ import {
   type UndoState,
 } from "./history.js";
 import { rootOf, type HandleIndex } from "./handles.js";
+import { UNDO_MARKER } from "./marker.js";
 import {
   UNDO_SOURCE,
   type SourceCommand,
@@ -196,9 +197,6 @@ function innermost(event: Event): Binding | undefined {
   }
   return undefined;
 }
-
-/** Marks an editor whose edits are the document's: its keys go to the service. */
-export const UNDO_MARKER = "data-patchwork-undo";
 
 const EDITING_HOST = '[contenteditable]:not([contenteditable="false"])';
 

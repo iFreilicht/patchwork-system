@@ -9,7 +9,8 @@ import { EditorView } from "@codemirror/view";
 import type { Patch, Prop } from "@automerge/automerge/slim";
 
 import type { AppliedEvent } from "./history.js";
-import { UNDO_MARKER, type Undo } from "./realm.js";
+import { UNDO_MARKER } from "./marker.js";
+import type { Undo } from "./realm.js";
 
 /**
  * Marks step boundaries where CodeMirror's own `history()` would: before a

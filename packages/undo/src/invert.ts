@@ -690,7 +690,18 @@ function write(
   ctx: InverseContext
 ): void {
   let id: string;
-  if (value.kind === "object") {
+  if (value.kind === "object" && insert && typeOf(be, obj) === "text") {
+    // A rich-text block marker. Inserted like `splitBlock` inserts one, so
+    // that bindings (such as @automerge/prosemirror) see a block, not an
+    // object-replacement character.
+    be.splitBlock(
+      obj,
+      prop as number,
+      plainValue(be, value.id, value.heads) as never
+    );
+    id = lastId(be, obj, prop);
+    mapCopy(be, value.id, id, value.heads, ctx);
+  } else if (value.kind === "object") {
     id = copyObject(be, value.id, value.type, value.heads, ctx, (empty) =>
       insert
         ? be.insertObject(obj, prop as number, empty)
@@ -718,6 +729,57 @@ function write(
     ctx.created.set(id, PENDING);
   }
   for (const original of ids) ctx.copies.set(original, id);
+}
+
+/**
+ * The value of `obj` at `heads` as plain JavaScript that keeps Automerge's
+ * datatypes when written back: strings as `ImmutableString` (scalars, not
+ * texts), counters as `Counter`.
+ */
+function plainValue(be: Backend, obj: string, heads: Heads): unknown {
+  const entry = (prop: Prop): unknown => {
+    const e = (be.getAll(obj, prop, heads) as Entry[]).at(-1);
+    if (!e) return undefined;
+    if (e.length === 2) {
+      if (e[0] === "text") return be.text(idOf(e), heads);
+      return plainValue(be, idOf(e), heads);
+    }
+    if (e[0] === "str") return new A.ImmutableString(e[1] as string);
+    if (e[0] === "counter") return new A.Counter(e[1] as number);
+    return e[1];
+  };
+  if (typeOf(be, obj, heads) === "list") {
+    return Array.from({ length: be.length(obj, heads) }, (_, i) => entry(i));
+  }
+  return Object.fromEntries(
+    be.keys(obj, heads).map((key) => [key, entry(key)])
+  );
+}
+
+/** Record `dst` as the copy of `src` (at `heads`), with all it contains. */
+function mapCopy(
+  be: Backend,
+  src: string,
+  dst: string,
+  heads: Heads,
+  ctx: InverseContext
+): void {
+  ctx.copies.set(src, dst);
+  const type = typeOf(be, src, heads);
+  const props: Prop[] =
+    type === "map" || type === "table"
+      ? be.keys(src, heads)
+      : Array.from({ length: be.length(src, heads) }, (_, i) => i);
+  for (const prop of props) {
+    const from = (be.getAll(src, prop, heads) as Entry[]).at(-1);
+    const to = (be.getAll(dst, prop) as Entry[]).at(-1);
+    if (!from || !to) continue;
+    if (typeof prop === "number") ctx.owners.set(idOf(to), dst);
+    ctx.copies.set(idOf(from), idOf(to));
+    if (from.length === 2 && to.length === 2) {
+      mapCopy(be, idOf(from), idOf(to), heads, ctx);
+    }
+  }
 }
 
 /**

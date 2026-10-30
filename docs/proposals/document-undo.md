@@ -494,7 +494,7 @@ editor's boundaries on as `checkpoint()` calls. For tldraw it also points
 the editor's undo commands at the service; a CodeMirror tool simply drops
 CodeMirror's history, and the realm's key binding takes the keys.
 
-Authors of tools built on CodeMirror or tldraw add the
+Authors of tools built on CodeMirror, ProseMirror or tldraw add the
 helpers once, where they set up the editor, next to their `undoFor` call
 ([Section 5](#5-backwards-compatibility) lists the steps). Users never see them: they get the same steps
 the editor's own history would make, and the same undo from the keys, the
@@ -519,6 +519,30 @@ The rest of this section specifies what the helpers do.
   comment drafts and chat inputs, keep their own undo.
 - `followUndo(view, undo, path)` moves the cursor to the end of the last
   change an undo or redo made to the text at `path`.
+
+`@inkandswitch/patchwork-undo/prosemirror`:
+
+- `undoBoundaries(undo): Plugin` replaces `prosemirror-history` and its
+  undo keymap. It marks the editor with `data-patchwork-undo` (through the
+  plugin's `attributes` prop), so the key binding and the browser's Edit
+  menu send Cmd/Ctrl+Z in the editor to the service. It ends a step at a
+  transaction marked with `prosemirror-history`'s `closeHistory(tr)` (by
+  that function's meta key, `closeHistory$`; pinned and tested against
+  prosemirror-history 1.5), so tools keep calling it. It does so in
+  `filterTransaction`, which runs before `@automerge/prosemirror` writes
+  the transaction to the document in `appendTransaction`. Unlike
+  CodeMirror's history, `prosemirror-history` treats neither pastes nor
+  selection changes as boundaries, and neither does the helper.
+- Rich text's block markers (paragraphs, headings: objects inside the
+  text) take part in adjacency like characters, and a deleted block marker
+  is restored the way `splitBlock` creates one, so bindings see a block.
+- `@automerge/prosemirror` 0.2.0 mistranslates a remote deletion that
+  spans block markers into the editor, so the view can drift from the
+  document. A collaborator's edit triggers it as much as an undo; the
+  document itself is correct. A test pins the bug, to notice its fix.
+- The ProseMirror packages aren't in the host's import map, so tools bundle
+  this subpath with their own ProseMirror; histories are still shared,
+  since the realm's state is global.
 
 `@inkandswitch/patchwork-codemirror` (not yet implemented, location TBD):
 
@@ -649,6 +673,14 @@ replay inverses computed before the service's undo.
 3. Add `undoBoundaries(undo)`; optionally `followUndo(view, undo, path)`.
 4. `undo.dispose()` on teardown.
 
+**Migrating a ProseMirror tool:**
+
+1. Remove `history()` and its undo keymap from the plugins.
+2. `const undo = undoFor(element, handle)`.
+3. Add `undoBoundaries(undo)` from `@inkandswitch/patchwork-undo/prosemirror`;
+   keep calling `closeHistory(tr)` where the tool did.
+4. `undo.dispose()` on teardown.
+
 **Migrating a tldraw tool:**
 
 1. `const undo = undoFor(element, handle, tldrawOptions(storePath))`.
@@ -702,8 +734,8 @@ Four things to know:
 1. **Steps.** Changes less than half a second apart form one step (typing
    words, not letters). Call `undo.checkpoint()` where your tool knows a
    boundary: a click, a finished gesture, leaving a field.
-2. **Editors.** For CodeMirror, replace `history()` with
-   `undoBoundaries(undo)`. For tldraw, pass `tldrawOptions()` and call
+2. **Editors.** For CodeMirror or ProseMirror, replace `history()` with
+   `undoBoundaries(undo)` from the matching subpath. For tldraw, pass `tldrawOptions()` and call
    `bindTldraw(editor, undo)`.
 3. **State.** `undo.subscribe(({ canUndo, canRedo }) => …)` for your own
    buttons; host UI uses `watchUndo(element, url, listener)` and needs no
@@ -714,8 +746,8 @@ Four things to know:
    edit arrives. Plain `<input>`s are fine for short fields such as a title;
    inside them, Cmd/Ctrl+Z stays the browser's. A ProseMirror editor (or any
    other contenteditable) that writes to the document needs the
-   `data-patchwork-undo` attribute, which `undoBoundaries` sets for you in
-   CodeMirror.
+   `data-patchwork-undo` attribute, which `undoBoundaries` sets for you, in
+   CodeMirror and in ProseMirror.
 
 The complete examples (a text tool, a canvas tool, a form tool, and an Edit
 menu) are in `packages/undo/examples/` and run in the test suite.
@@ -749,6 +781,10 @@ menu) are in `packages/undo/examples/` and run in the test suite.
   - `codemirror.test.ts`: the same transactions into CodeMirror's history
     and into the service; equal after every undo and redo, in eight
     sessions, plus the intended difference;
+  - `prosemirror.test.ts`: the same transactions into ProseMirror with
+    `prosemirror-history` and into an editor synced by
+    `@automerge/prosemirror` with the service; equal after every undo and
+    redo, in eight sessions (paragraph splits and joins among them);
   - `tldraw.test.ts`: the same interactions on a tldraw editor with its
     own history and on one bound to the service, through a store mirror;
   - `realm.test.ts`, `examples.test.ts`: keys, focus, form fields, sub-
@@ -879,13 +915,6 @@ while re-creating an equal object produces operations and patches; the visibilit
 
 ## 11. Open issues
 
-- **ProseMirror.** There is no helper for ProseMirror yet. A ProseMirror
-  tool can integrate by hand: drop `prosemirror-history` and its keymap,
-  mark the editor with `data-patchwork-undo` (the view's `attributes`
-  prop), and pass boundaries on as `checkpoint()` calls. To do: a
-  `@inkandswitch/patchwork-undo/prosemirror` plugin doing all three,
-  compared against `prosemirror-history` like the CodeMirror helper is
-  against CodeMirror's history.
 - **Frame tools with several panes.** The tiling frame tool mounts every
   panel as a `<patchwork-view>` in the tab, without iframes, so all panels
   share one realm. Each panel wraps its tool in a draft state and draft

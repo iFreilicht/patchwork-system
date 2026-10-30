@@ -108,6 +108,33 @@ the same texts for the same transactions
 ([`test/codemirror.test.ts`](test/codemirror.test.ts)). (From
 [`examples/text.js`](examples/text.js).)
 
+### ProseMirror
+
+Drop `prosemirror-history` and its keymap, and add the plugin:
+
+```ts
+import { undoFor } from "@inkandswitch/patchwork-undo";
+import { undoBoundaries } from "@inkandswitch/patchwork-undo/prosemirror";
+
+const undo = undoFor(root, handle);
+const view = new EditorView(root, {
+  state: EditorState.create({
+    schema,
+    doc: pmDoc,
+    plugins: [plugin, undoBoundaries(undo)],
+  }),
+});
+```
+
+`plugin`, `schema` and `pmDoc` come from `@automerge/prosemirror`'s
+`init(handle, path)`. `undoBoundaries` marks the editor so Cmd/Ctrl+Z in it
+goes to the service, and ends a step at `closeHistory(tr)`, as
+`prosemirror-history` does. Bundle this subpath with your tool: ProseMirror
+isn't in Patchwork's import map. With these, `prosemirror-history` and the
+service produce the same texts for the same transactions
+([`test/prosemirror.test.ts`](test/prosemirror.test.ts)), paragraphs
+included; formatting marks are not undone yet.
+
 ### tldraw
 
 ```js
