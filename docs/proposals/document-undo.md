@@ -402,7 +402,7 @@ that crosses only invisible steps reports `applied: false`.
 ### 4.9 Inverting a step
 
 **EDITOR's note:** This section is dense, reeks of barely comprehensible LLM-
-speak and mostly duplicates the behavior of the code. Consider rewriting or dropping it.
+speak and mostly duplicates the behavior of the code. Consider rewriting it.
 
 The step's operations are decoded (`getBackend(doc).getDecodedChangeByHash`;
 op ids are `${startOp + i}@${actor}`). Decoded operations carry `elemId`
@@ -985,9 +985,17 @@ had, which is how automerge-repo opens a document from storage or sync.
 _Workaround:_ the Repo sets its `author` again after every mutation
 (`patches/@automerge__automerge-repo@2.6.0-subduction.48.patch`).
 
-`A.marks(A.view(doc, heads), path)` returns the current formatting, not
-the formatting at `heads`; the backend's `marks(obj, heads)` is correct and
-is what the engine uses.
+**Formatting read from a historical view is the current formatting.**
+`A.marks(A.view(doc, heads), path)` returns the formatting as it is now, not
+as it was at `heads`: the wrapper in `@automerge/automerge`
+(`javascript/src/implementation.ts`) calls the wasm `Automerge.marks`
+without the view's heads, unlike `A.spans` and `A.getCursor`, which pass
+them (automerge#1653 [11]). The wasm function itself
+(`rust/automerge-wasm/src/lib.rs`) takes optional heads and reads the
+formatting at them correctly. _Workaround:_
+the engine calls the wasm function directly, as
+`A.getBackend(doc).marks(obj, heads)`. _Once fixed_ (the wrapper passes
+`state.heads`), the engine can use `A.marks` on a view.
 
 Writing an equal scalar value is a no-op in Automerge 3.5 (no operation),
 while re-creating an equal object produces operations and patches; the visibility rule of
@@ -1102,3 +1110,4 @@ while re-creating an equal object produces operations and patches; the visibilit
    https://www.gnu.org/software/emacs/manual/html_node/emacs/Undo.html
 9. Automerge issue #1607. https://github.com/automerge/automerge/issues/1607
 10. Automerge issue #1598. https://github.com/automerge/automerge/issues/1598
+11. Automerge issue #1653. https://github.com/automerge/automerge/issues/1653
