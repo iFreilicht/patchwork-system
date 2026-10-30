@@ -205,6 +205,7 @@ type UndoOptions = {
   ignore?: (path: Prop[]) => boolean;
   conflict?: "skip" | "force"; // default "skip"
   now?: () => number; // the grouping clock; default Date.now
+  restore?: number; // steps rebuilt at a time (4.15); default 10, 0: none
   repo?: { handles: Record<DocumentId, DocHandle<unknown>> }; // default window.repo
 };
 
@@ -283,7 +284,9 @@ A change belongs to the realm if its actor equals the document's actor in
 this realm (`Automerge.getActorId(doc)`), compared with
 `getChangesMetaSince(doc, lastHeads)[i].actor`. Changes by any other actor
 are never recorded and never inverted. Changes made by an undo or redo are
-the realm's own and belong to the current run.
+the realm's own and belong to the current run. A new history also rebuilds
+steps from the realm's earlier changes, its previous loads' among them
+([4.15](#415-restoring-a-history)).
 
 ### 4.4 Key binding and focus
 
@@ -676,6 +679,46 @@ a tool whose realm is not the frame's:
   already requires for `repo:handle-descriptor`, the undo provider works
   unchanged.
 
+### 4.15 Restoring a history
+
+Histories live in memory, and every load of a document gets a new actor. A
+new history therefore rebuilds steps from the changes already in the
+document that are the realm's: those of the document's actor (a history
+created again after the last tool closed), and those of every actor with
+the document's Automerge `author` (`getActorsForAuthor(doc,
+getAuthor(doc))`: earlier loads). Every Repo Patchwork builds sets `author`
+to its signer's verifying key (`patchwork.signer.verifyingKey`, hex), so
+the earlier loads are this browser profile's. Automerge records the author
+in an actor's first change only; the Repo sets it on every document before
+that change.
+
+- **Lazily.** The newest `restore` steps (default 10; `0` turns restoring
+  off) are rebuilt when the history is created, and the next `restore` when
+  an undo reaches the oldest rebuilt step. The undo that reaches it goes on
+  into them, and a run's `start` and `pointer` move up by the steps added
+  below. Finding the realm's changes reads every change's metadata once
+  (`getChangesMetaSince(doc, [])`); only the rebuilt steps' changes are
+  decoded.
+- **Grouping.** A change keeps no checkpoints, millisecond times or text
+  ranges, so [4.6](#46-steps-and-grouping) can't be replayed: consecutive
+  changes of one actor at most one second apart (Automerge's `time` is in
+  whole seconds) join one step. Changes only to ignored paths are left out.
+- **Runs.** The change an undo or redo press makes carries the message
+  `patchwork-undo` (`PRESS_MESSAGE`). Consecutive press changes of one actor
+  form one step, as the run did when it ended ([4.7](#47-runs)). A run that
+  ended where it started left no step; rebuilt, its step is invisible and
+  skipped ([4.8](#48-visibility)).
+- **Not rebuilt:** a document's first change (`Repo.create` with an initial
+  value) and a change that sets `@patchwork` (`patchwork.create`, which runs
+  the datatype's `init`): undoing them would take away the structure tools
+  expect.
+- **Positions.** The inverse compares changes by their position in the
+  realm's chain ([Section 9](#9-automerge-limitations-and-workarounds),
+  item 2). A rebuilt history spans several actors, whose `seq` count each
+  actor's changes separately, so a change's position is its index in the
+  document's change order (`InverseContext.positions`); changes recorded
+  later continue from the number of changes there were.
+
 ## 5. Backwards compatibility
 
 The change is additive. `accept` producers get a second argument, which
@@ -719,10 +762,11 @@ Undo only ever writes inverses of the realm's own changes, through the same
 It never reads or writes other documents. Nothing leaves the realm except
 through normal sync: the provider messages carry document URLs and the
 booleans `canUndo` / `canRedo` and a timestamp of the user's last use, to
-the host page, which already knows the URLs. Histories are not persisted.
+the host page, which already knows the URLs. Histories are not persisted;
+they are rebuilt from the document ([4.15](#415-restoring-a-history)).
 
 Every change records its signer's verifying key as its actor's `author`
-([11](#11-open-issues), Persistence). The key is public, but it stays in
+([4.15](#415-restoring-a-history)). The key is public, but it stays in
 each document's history for good and links the changes one browser profile
 makes across all documents it edits.
 
@@ -821,6 +865,11 @@ menu) are in `packages/undo/examples/` and run in the test suite.
     redo, in eight sessions (paragraph splits and joins among them);
   - `tldraw.test.ts`: the same interactions on a tldraw editor with its
     own history and on one bound to the service, through a store mirror;
+  - `restore.test.ts`: steps rebuilt from a previous load with the same
+    author and from the history's own actor, another author's changes left
+    alone, grouping by time, a previous load's run kept in one step, older
+    steps rebuilt once undo reaches them, and the document's creation not
+    rebuilt;
   - `realm.test.ts`, `examples.test.ts`: keys, focus, form fields, sub-
     handles, draft swaps, the provider, and the example tools;
   - `packages/e2e/tests/undo.spec.ts` (Playwright): the collaboration
@@ -898,8 +947,9 @@ list at old heads.
    didn't exist yet at those heads, so the two can't be told apart by the
    error. _Workaround:_ catch it and use `length(obj, heads)`; elements the
    realm created are checked against the heads first (the realm's changes
-   form a chain by `seq`, so an element exists at the heads of a later own
-   change iff its change's `seq` is lower).
+   form a chain by position ([4.15](#415-restoring-a-history)), so an
+   element exists at the heads of a later own change iff its change's
+   position is lower).
 3. **Reading heads inside `change()` commits** the pending operations as a
    change of their own, which the returned document doesn't show
    (automerge#1607 [9]; sibling automerge#1598 [10]). The same holds for
@@ -928,6 +978,12 @@ list at old heads.
    lookup for copies the same inverse made. _Once fixed_ (an index at old
    heads, or a batch "ids of this sequence at these heads"), the run
    heuristic goes away.
+
+**The author is lost on load.** `A.load(bytes, { author })` ignores
+`author`, and `loadIncremental` into an empty document drops the one it
+had, which is how automerge-repo opens a document from storage or sync.
+_Workaround:_ the Repo sets its `author` again after every mutation
+(`patches/@automerge__automerge-repo@2.6.0-subduction.48.patch`).
 
 `A.marks(A.view(doc, heads), path)` returns the current formatting, not
 the formatting at `heads`; the backend's `marks(obj, heads)` is correct and
@@ -996,18 +1052,17 @@ while re-creating an equal object produces operations and patches; the visibilit
   visibility is judged on the document's JSON, so such a press is not skipped,
   and the user sees no effect. This likely has to be resolved by each tool-
   author; we cannot judge which change is user-visible from inside the framework.
-- **Persistence.** Histories live in memory; closing the last tool on a
-  document or reloading starts empty. Every load gets a new actor, so the
-  steps have to be rebuilt from the document's commits by author rather
-  than by actor. Every Repo Patchwork builds records its signer's verifying
-  key (`patchwork.signer.verifyingKey`, hex) as the Automerge `author` of
-  its actors, so `getActorsForAuthor(doc, key)` lists the actors this
-  browser profile wrote as. Automerge records the author in an actor's
-  first change only; the Repo sets it on every document before that change.
-  Rebuilding steps from those actors' commits is not implemented. Its
-  limits:
+- **Restored histories** ([4.15](#415-restoring-a-history)) have limits:
   - The scope is the browser profile, not the tab: every tab on an origin
-    shares one signer, so a restored history holds what all of them did.
+    shares one signer, so a restored history holds what all of them did,
+    including another tab open at the same time. Two such tabs' changes
+    don't form a chain, which the inverse's positions assume.
+  - Their steps are grouped by time alone, so they can differ from the
+    steps the earlier load had.
+  - What the inverse remembers across steps (copies of restored objects,
+    every value written into a list element) is rebuilt only from the
+    rebuilt steps' changes, not from older ones or from the earlier load's
+    copies.
   - Changes made before Patchwork set `author` have none and can't be
     restored.
   - `author` is self-asserted: any peer can write any key. For undo this

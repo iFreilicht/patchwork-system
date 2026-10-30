@@ -1,5 +1,6 @@
 export {
   UndoHistory,
+  PRESS_MESSAGE,
   defaultIgnore,
   type AppliedEvent,
   type ConflictPolicy,

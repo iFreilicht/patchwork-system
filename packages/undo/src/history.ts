@@ -1,5 +1,10 @@
 import * as A from "@automerge/automerge/slim";
-import type { Heads, Patch, Prop } from "@automerge/automerge/slim";
+import type {
+  ChangeMetadata,
+  Heads,
+  Patch,
+  Prop,
+} from "@automerge/automerge/slim";
 import type { DocHandle } from "@automerge/automerge-repo/slim";
 
 import { CopyMap } from "./copies.js";
@@ -46,6 +51,14 @@ export type UndoHistoryOptions = {
   conflict?: ConflictPolicy;
   /** The clock steps are grouped by. Default `Date.now`. */
   now?: () => number;
+  /**
+   * How many steps to rebuild at a time from the realm's changes made before
+   * the history existed: the document's actor's, and those of every actor
+   * with the document's Automerge author (a previous load's). The newest are
+   * rebuilt at once, older ones when undo reaches them. Default 10; 0
+   * rebuilds none.
+   */
+  restore?: number;
 };
 
 export type UndoState = { canUndo: boolean; canRedo: boolean };
@@ -68,6 +81,28 @@ type Step = {
   lastTime: number;
   ranges: TextRanges;
 };
+
+/** A step being rebuilt from changes, newest first. */
+type Restored = {
+  actor: string;
+  press: boolean;
+  /** The time of its oldest change so far, in seconds. */
+  time: number;
+  changes: string[];
+};
+
+/**
+ * The message of a change an undo or redo press makes, so that a rebuilt
+ * history can tell a run's changes apart and keep them in one step.
+ */
+export const PRESS_MESSAGE = "patchwork-undo";
+
+/**
+ * Rebuilt changes at most this many seconds apart join one step. Automerge
+ * keeps a change's time in whole seconds and keeps no checkpoints or text
+ * ranges, so rebuilt steps are grouped by actor and time alone.
+ */
+const RESTORE_JOIN_S = 1;
 
 /**
  * Consecutive undo and redo presses: a pointer that walks back and forth
@@ -121,6 +156,11 @@ export class UndoHistory implements UndoControls {
   #checkpoint = false;
   #applying: string[] | null = null;
   #disposed = false;
+  /** The realm's changes from before the history existed, oldest first. */
+  #backlog: ChangeMetadata[] = [];
+  #restoreBatch: number;
+  /** The position the next change takes in the realm's chain. */
+  #position = 0;
 
   readonly #ctx: InverseContext;
   readonly #ignores = new Set<IgnorePath>();
@@ -147,6 +187,7 @@ export class UndoHistory implements UndoControls {
       values: new Map(),
       elements: new Map(),
       created: new Map(),
+      positions: new Map(),
       ignore: (path) =>
         defaultIgnore(path) ||
         [...this.#ignores].some((ignore) => ignore(path)),
@@ -155,6 +196,9 @@ export class UndoHistory implements UndoControls {
     if (options.groupDelayMs !== undefined) {
       this.#delays.set(this, options.groupDelayMs);
     }
+    this.#restoreBatch = options.restore ?? 10;
+    this.#backlog = this.#ownChanges(doc);
+    this.#restore();
     handle.on("change", this.#onChange);
   }
 
@@ -217,7 +261,8 @@ export class UndoHistory implements UndoControls {
     let result = NOTHING;
     // A step whose inverse changes nothing visible is skipped, so that
     // every press visibly does something.
-    while (run.pointer > 0 && !result.applied) {
+    while (!result.applied) {
+      if (run.pointer === 0 && this.#restore() === 0) break;
       const i = run.pointer - 1;
       const { hashes, ...applied } = this.#apply(
         this.#steps[i]!.changes,
@@ -227,6 +272,8 @@ export class UndoHistory implements UndoControls {
       run.pointer = i;
       result = merge(result, applied);
     }
+    // So that `canUndo` knows whether anything is left below.
+    if (run.pointer === 0) this.#restore();
     this.#finish("undo", result);
     return result;
   }
@@ -256,6 +303,8 @@ export class UndoHistory implements UndoControls {
     this.#steps = [];
     this.#run = undefined;
     this.#checkpoint = false;
+    this.#backlog = [];
+    this.#ctx.positions.clear();
     this.#ctx.copies.clear();
     this.#ctx.owners.clear();
     this.#ctx.values.clear();
@@ -333,14 +382,17 @@ export class UndoHistory implements UndoControls {
     this.#applying = collected;
     try {
       if (plan.actions.length > 0) {
-        handle.change((d: unknown) => {
-          outcome = executeInverse(
-            A.getBackend(d as A.Doc<unknown>),
-            plan,
-            this.#ctx,
-            options.conflict ?? this.#conflict
-          );
-        });
+        handle.change(
+          (d: unknown) => {
+            outcome = executeInverse(
+              A.getBackend(d as A.Doc<unknown>),
+              plan,
+              this.#ctx,
+              options.conflict ?? this.#conflict
+            );
+          },
+          { message: PRESS_MESSAGE }
+        );
       }
       this.#sync();
     } finally {
@@ -380,7 +432,13 @@ export class UndoHistory implements UndoControls {
       return;
     }
     for (const meta of local) {
-      const ops = opsOf(A.getBackend(doc), meta.hash, { n: 0 });
+      this.#ctx.positions.set(meta.hash, this.#position++);
+      const ops = opsOf(
+        A.getBackend(doc),
+        meta.hash,
+        { n: 0 },
+        this.#ctx.positions
+      );
       this.#register(ops);
       if (this.#applying) {
         this.#applying.push(meta.hash);
@@ -435,25 +493,8 @@ export class UndoHistory implements UndoControls {
     deps: Heads,
     ops: readonly OpRecord[]
   ) {
-    const be = A.getBackend(doc);
-    let relevant = false;
-    const paths = new Map<string, Prop[] | undefined>();
-    for (const { op } of ops) {
-      if (relevant) break;
-      let path = paths.get(op.obj);
-      if (!paths.has(op.obj)) {
-        path = pathOf(be, op.obj, [hash]) ?? pathOf(be, op.obj, deps);
-        paths.set(op.obj, path);
-      }
-      if (!path) relevant = true;
-      else if (
-        !this.#ctx.ignore(op.key !== undefined ? [...path, op.key] : path)
-      ) {
-        relevant = true;
-      }
-    }
     // Changes only to ignored paths neither form steps nor end a run.
-    if (!relevant) return;
+    if (!this.#relevant(doc, hash, deps, ops)) return;
 
     this.#endRun();
 
@@ -482,6 +523,111 @@ export class UndoHistory implements UndoControls {
         ranges: ranges.after,
       });
     }
+  }
+
+  #relevant(
+    doc: A.Doc<unknown>,
+    hash: string,
+    deps: Heads,
+    ops: readonly OpRecord[]
+  ): boolean {
+    const be = A.getBackend(doc);
+    const paths = new Map<string, Prop[] | undefined>();
+    for (const { op } of ops) {
+      let path = paths.get(op.obj);
+      if (!paths.has(op.obj)) {
+        path = pathOf(be, op.obj, [hash]) ?? pathOf(be, op.obj, deps);
+        paths.set(op.obj, path);
+      }
+      if (!path) return true;
+      if (!this.#ctx.ignore(op.key !== undefined ? [...path, op.key] : path))
+        return true;
+    }
+    return false;
+  }
+
+  /**
+   * The realm's changes already in the document, oldest first, each given
+   * its position in the chain. Positions follow the document's change order,
+   * so the history's own changes come after all of them.
+   */
+  #ownChanges(doc: A.Doc<unknown>): ChangeMetadata[] {
+    if (this.#restoreBatch <= 0) return [];
+    const metas = A.getChangesMetaSince(doc, []);
+    this.#position = metas.length;
+    const author = A.getAuthor(doc);
+    const own = new Set([
+      this.#actor,
+      ...(author ? A.getActorsForAuthor(doc, author) : []),
+    ]);
+    return metas.filter((meta, i) => {
+      if (!own.has(meta.actor)) return false;
+      this.#ctx.positions.set(meta.hash, i);
+      return true;
+    });
+  }
+
+  /**
+   * Rebuild up to `restore` more steps from the backlog, the newest first,
+   * below the steps there are. Returns how many. A run's indices move up
+   * with the steps above them.
+   */
+  #restore(): number {
+    if (this.#backlog.length === 0) return 0;
+    const doc = this.handle.doc() as A.Doc<unknown>;
+    const be = A.getBackend(doc);
+    const restored: Restored[] = [];
+    let step: Restored | undefined;
+    while (this.#backlog.length > 0) {
+      const meta = this.#backlog.pop()!;
+      const ops = opsOf(be, meta.hash, { n: 0 }, this.#ctx.positions);
+      this.#register(ops);
+      if (createsDocument(meta, ops)) continue;
+      if (!this.#relevant(doc, meta.hash, meta.deps, ops)) continue;
+      const press = meta.message === PRESS_MESSAGE;
+      // A run's presses form one step, as when the run ended (`#endRun`).
+      if (
+        step &&
+        step.actor === meta.actor &&
+        step.press === press &&
+        (press || step.time - meta.time <= RESTORE_JOIN_S)
+      ) {
+        step.changes.unshift(meta.hash);
+        step.time = meta.time;
+        continue;
+      }
+      if (step) restored.push(step);
+      step = undefined;
+      if (restored.length === this.#restoreBatch) {
+        this.#backlog.push(meta);
+        break;
+      }
+      step = {
+        actor: meta.actor,
+        press,
+        time: meta.time,
+        changes: [meta.hash],
+      };
+    }
+    if (step) restored.push(step);
+
+    const n = restored.length;
+    this.#steps.unshift(
+      ...restored.reverse().map(({ changes }) => ({
+        changes,
+        lastTime: -Infinity,
+        ranges: new Map(),
+      }))
+    );
+    const run = this.#run;
+    if (run && n > 0) {
+      run.start += n;
+      run.pointer += n;
+      run.undone = new Map(
+        [...run.undone].map(([i, hashes]) => [i + n, hashes])
+      );
+    }
+    return n;
   }
 
   /**
@@ -515,6 +661,19 @@ function isTextIn(doc: A.Doc<unknown>, heads: Heads) {
     }
     return typeof value === "string";
   };
+}
+
+/**
+ * Whether a change created the document: its first change (`Repo.create`
+ * with an initial value), or the one that made it a Patchwork document of
+ * its datatype (`patchwork.create`). Undoing either would take away the
+ * structure tools expect, so neither is rebuilt.
+ */
+function createsDocument(meta: ChangeMetadata, ops: readonly OpRecord[]) {
+  return (
+    meta.deps.length === 0 ||
+    ops.some(({ op }) => op.obj === "_root" && op.key === "@patchwork")
+  );
 }
 
 function merge(a: UndoResult, b: UndoResult): UndoResult {

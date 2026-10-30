@@ -33,7 +33,7 @@ export type OpRecord = {
   /** The heads the op's change was made at. */
   deps: Heads;
   hash: string;
-  /** The change's sequence number among its actor's changes. */
+  /** The change's position in the realm's chain ({@link InverseContext.positions}). */
   seq: number;
   order: number;
 };
@@ -56,6 +56,12 @@ export type InverseContext = {
    * a later change of its own iff its `seq` is lower.
    */
   created: Map<string, number>;
+  /**
+   * Change hash → its position in the realm's chain, the `seq` of its ops. A
+   * history restored from several actors' changes can't use their own
+   * sequence numbers, which count each actor's changes separately.
+   */
+  positions: Map<string, number>;
   ignore: (path: Prop[]) => boolean;
 };
 
@@ -165,15 +171,21 @@ const MAKE = /^make(Map|List|Text|Table)$/;
 /** `created` of an element written by the inverse being applied. */
 const PENDING = Infinity;
 
-export function opsOf(be: Backend, hash: string, order: { n: number }) {
+export function opsOf(
+  be: Backend,
+  hash: string,
+  order: { n: number },
+  positions: Map<string, number>
+) {
   const change = be.getDecodedChangeByHash(hash);
   if (!change) return [];
+  const seq = positions.get(hash) ?? change.seq;
   return (change.ops as unknown as DecodedOp[]).map((op, i): OpRecord => ({
     id: `${change.startOp + i}@${change.actor}`,
     op,
     deps: change.deps,
     hash,
-    seq: change.seq,
+    seq,
     order: order.n++,
   }));
 }
@@ -333,7 +345,7 @@ export function planInverse(
   const be = A.getBackend(doc);
   const now = A.getHeads(doc);
   const counter = { n: 0 };
-  const ops = hashes.flatMap((hash) => opsOf(be, hash, counter));
+  const ops = hashes.flatMap((hash) => opsOf(be, hash, counter, ctx.positions));
 
   const created = new Set<string>();
   for (const { id, op } of ops) if (MAKE.test(op.action)) created.add(id);
