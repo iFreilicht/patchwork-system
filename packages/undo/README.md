@@ -133,7 +133,7 @@ goes to the service, and ends a step at `closeHistory(tr)`, as
 isn't in Patchwork's import map. With these, `prosemirror-history` and the
 service produce the same texts for the same transactions
 ([`test/prosemirror.test.ts`](test/prosemirror.test.ts)), paragraphs
-included; formatting marks are not undone yet.
+and formatting included.
 
 ### tldraw
 

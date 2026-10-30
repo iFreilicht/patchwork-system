@@ -230,7 +230,6 @@ type UndoResult = {
   applied: boolean; // the press changed the document visibly
   patches: Patch[]; // between the document before and after
   skipped: Array<{ path: Prop[]; reason: "conflict" | "unreachable" }>;
-  unsupported: number; // ops left alone (rich-text marks)
 };
 type AppliedEvent = UndoResult & { direction: "undo" | "redo" };
 
@@ -389,7 +388,9 @@ A press is _visible_ if, for some patch between the heads before and after
 it (not on an ignored path), the JSON of the value at the patch's path
 (the sequence, for an index path) differs between the two states, compared
 with object keys sorted (an Automerge document's key order follows the
-order of its patches). An empty `diff` is not the criterion: re-creating an
+order of its patches), or, for a text, its formatting (`marks`) differs:
+formatting doesn't show in a text's JSON, and a character can be replaced
+by an equal one with other formats. An empty `diff` is not the criterion: re-creating an
 equal object produces patches. A step whose inverse changes nothing visible
 (a character typed and deleted within one step, an equal object written) is
 skipped in both directions, so every press visibly does something. A press
@@ -413,7 +414,7 @@ lacks. They are classified:
 | set or deleted a map key, or overwrote a list element (first and last operation per key or element) | restore the value from before the step's first operation on it, if the current value is still the step's last; else a conflict |
 | incremented a counter                                                                               | increment by the negative sum                                                                                                  |
 | anything inside an object the step created                                                          | nothing: the object goes with its own inverse                                                                                  |
-| `markBegin` / `markEnd`                                                                             | nothing; counted as unsupported                                                                                                |
+| `markBegin` / `markEnd` (a format set or removed over a range)                                      | restore each part of the range to the format it had before; a conflict where the format changed since                          |
 | an element inserted and deleted within the step                                                     | nothing                                                                                                                        |
 | an operation on an ignored path                                                                     | nothing                                                                                                                        |
 
@@ -455,6 +456,25 @@ The inverse is executed in rounds, each in this order:
      inverse already reinserted there.
 4. **Counter increments.**
 
+After the rounds, re-inserted characters get the formats they had before
+the step (where they were deleted, or, if the step formatted their text
+before deleting them, where the step began): a copy is a new element and
+carries no formatting. One `mark` or `unmark` covers each run of adjacent
+characters missing the same value. Copied texts take their source's
+formatting along.
+
+Then the step's formatting is undone, newest first. Each change's `mark`
+patches give the ranges it formatted; the patches of a change apply one
+after another, so a range is mapped back through the text splices before
+it (characters the change inserted drop out, the inverse removes them).
+The range is split where the format had different values before the
+change, and each piece gets its old value back (`mark`, or `unmark` where
+there was none), using the `expand` of the step's own mark. The ends of a
+piece are found by element, or by their tombstones if gone; characters
+this inverse re-inserted are left out, they have their own formats back.
+If the format no longer has the step's value over a piece, someone else
+changed it since: a conflict, under the conflict policy ([4.10](#410-conflict-policy)).
+
 A round runs every action whose target object (followed) is reachable; the
 rounds repeat while one makes another's target reachable (a restored
 record, then the text inside it). Actions still unreachable are reported as
@@ -475,8 +495,10 @@ edits inside it. Both follow from undoing only one's own operations.
 With `conflict: "skip"` (default), a restore whose target's current value is
 not the step's last value (someone else set it since, or a concurrent value
 shows as a second value at the key) is skipped and reported as
-`{ path, reason: "conflict" }`. With `"force"`, the old value is restored
-anyway. The policy is set per history (`UndoOptions.conflict`) and per
+`{ path, reason: "conflict" }`. Formatting is handled the same way: if the
+format no longer has the step's value over a range (someone else bolded or
+unbolded it since), that range is skipped and reported with the text's
+path. With `"force"`, the old value is restored anyway. The policy is set per history (`UndoOptions.conflict`) and per
 press (`undo({ conflict })`).
 
 ### 4.11 Editor helpers
@@ -536,6 +558,8 @@ The rest of this section specifies what the helpers do.
 - Rich text's block markers (paragraphs, headings: objects inside the
   text) take part in adjacency like characters, and a deleted block marker
   is restored the way `splitBlock` creates one, so bindings see a block.
+  Formatting (bold, emphasis, links) is undone with the text
+  ([4.9](#49-inverting-a-step)), so undoing Cmd+B removes the bold.
 - `@automerge/prosemirror` 0.2.0 mistranslates a remote deletion that
   spans block markers into the editor, so the view can drift from the
   document. A collaborator's edit triggers it as much as an undo; the
@@ -819,11 +843,15 @@ same document.
 | Bob types L                           | AC              | BDFL          |
 
 **Fuzzing.** 2 × 2 000 seeds × 500 actions against the oracle (seeds
-1–2 000 and 2 001–4 000) pass, about 15 minutes each; so do 2 × 667 seeds ×
-500 actions on a shared section (no throws, the peers converge). The fuzzer
-found the inversion's bugs while it was being written: cancel rules
-within runs, list positions next to tombstones, reinsertion into copied
-objects, the step-back rule, and the order of removals and reinsertions.
+1–2 000 and 2 001–4 000), with formatting (bold, italic and links set and
+removed over random ranges, compared as part of each snapshot), pass in
+about 27 minutes each; so do 2 × 667 seeds × 500 actions on a shared
+section (no throws, the peers converge). The fuzzer found the inversion's
+bugs while it was being written: cancel rules within runs, list positions
+next to tombstones, reinsertion into copied objects, the step-back rule,
+the order of removals and reinsertions, and, for formatting, ranges in a
+change's sequential patch coordinates, formats of re-inserted characters,
+and several formatting operations within one change.
 CI runs 30 + 10 seeds × 150 actions.
 
 **Cost**, measured with `BENCH=1 vitest run test/bench.test.ts` (Node 24,
@@ -833,8 +861,8 @@ a history attached, including recording it):
 
 | Characters | A change, no history | A change, recorded | Undo a typed step | Undo a 1 000-character deletion | Redo it |
 | ---------- | -------------------- | ------------------ | ----------------- | ------------------------------- | ------- |
-| 10 000     | 0.07 ms              | 0.10 ms            | 1.95 ms           | 77 ms                           | 43 ms   |
-| 100 000    | 0.05 ms              | 0.09 ms            | 15.8 ms           | 96 ms                           | 58 ms   |
+| 10 000     | 0.08 ms              | 0.11 ms            | 2.3 ms            | 132 ms                          | 67 ms   |
+| 100 000    | 0.07 ms              | 0.11 ms            | 16.5 ms           | 175 ms                          | 80 ms   |
 
 Recording costs one `getDecodedChangeByHash` and one single-change `diff`
 per local change: a few hundredths of a millisecond. Undoing a step costs
@@ -890,6 +918,10 @@ list at old heads.
    lookup for copies the same inverse made. _Once fixed_ (an index at old
    heads, or a batch "ids of this sequence at these heads"), the run
    heuristic goes away.
+
+`A.marks(A.view(doc, heads), path)` returns the current formatting, not
+the formatting at `heads`; the backend's `marks(obj, heads)` is correct and
+is what the engine uses.
 
 Writing an equal scalar value is a no-op in Automerge 3.5 (no operation),
 while re-creating an equal object produces operations and patches; the visibility rule of
@@ -973,8 +1005,6 @@ while re-creating an equal object produces operations and patches; the visibilit
 - **Grouping across tools.** Tools sharing a history with different
   `groupDelayMs` currently use the largest; per-tool grouping would need to know
   which tool made a change.
-- **Marks in rich text.** Marks (`markBegin` / `markEnd`) are left alone and
-  counted into `unsupported`; block markers in rich text are copied as text.
 
 ## 12. References
 

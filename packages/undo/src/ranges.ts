@@ -138,3 +138,36 @@ export function addRanges(into: TextRanges, from: TextRanges): void {
     for (const range of list) push(into, key, [range[0], range[1]]);
   }
 }
+
+/**
+ * The characters `[start, end)` (after `splices`, for the text at `key`)
+ * mapped back to before the splices. Characters the splices inserted drop
+ * out; undefined if none is left.
+ */
+export function mapCharsBack(
+  start: number,
+  end: number,
+  splices: readonly TextSplice[],
+  key: string
+): [number, number] | undefined {
+  let first = start;
+  let last = end - 1;
+  for (let i = splices.length - 1; i >= 0; i--) {
+    const s = splices[i]!;
+    if (s.key !== key) continue;
+    // Undo the insertion: characters in it drop out.
+    if (s.insert > 0) {
+      if (first >= s.index + s.insert) first -= s.insert;
+      else if (first >= s.index) first = s.index;
+      if (last >= s.index + s.insert) last -= s.insert;
+      else if (last >= s.index) last = s.index - 1;
+    }
+    // Undo the deletion: characters at or after it were further on.
+    if (s.remove > 0) {
+      if (first >= s.index) first += s.remove;
+      if (last >= s.index) last += s.remove;
+    }
+    if (last < first) return undefined;
+  }
+  return [first, last + 1];
+}

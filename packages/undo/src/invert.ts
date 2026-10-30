@@ -2,6 +2,8 @@ import * as A from "@automerge/automerge/slim";
 import type { Heads, Prop } from "@automerge/automerge/slim";
 
 import type { CopyMap } from "./copies.js";
+import { mapCharsBack, pathKey, textSplices } from "./ranges.js";
+import { objectAt, stableJSON } from "./visible.js";
 
 type Backend = ReturnType<typeof A.getBackend>;
 type ObjType = "map" | "list" | "text" | "table";
@@ -66,8 +68,6 @@ export type Skipped = {
 
 export type InverseOutcome = {
   skipped: Skipped[];
-  /** Ops the inverse can't undo, such as rich-text marks. */
-  unsupported: number;
 };
 
 type Value =
@@ -103,6 +103,13 @@ type Reinsert = {
   position?: number;
   /** `seq` of the change that deleted the element. */
   seq: number;
+  /**
+   * The element before it where it was deleted, unless that is the previous
+   * element this inverse re-inserts (which it then follows anyway).
+   */
+  before?: string;
+  /** Texts: the formats the element had where it was deleted. */
+  formats?: Record<string, unknown>;
 };
 
 type Remove = {
@@ -121,14 +128,36 @@ type Increment = {
   delta: number;
 };
 
-type Action = Restore | Reinsert | Remove | Increment;
+/**
+ * A format (a rich-text mark) the step set or removed over a range,
+ * restored per segment to the value it had there before.
+ */
+type Format = {
+  kind: "format";
+  order: number;
+  obj: string;
+  name: string;
+  /** The step's value: what the range should still have; null for none. */
+  value: unknown;
+  expand: "before" | "after" | "both" | "none";
+  segments: Array<{
+    first: string;
+    last: string;
+    prev: unknown;
+    /** Where the segment was, `[from, to)` at `heads`. */
+    from: number;
+    to: number;
+    heads: Heads;
+  }>;
+};
+
+type Action = Restore | Reinsert | Remove | Increment | Format;
 
 type Empty = Record<string, never> | never[] | string;
 type Datatype = "int" | "uint" | "f64" | "counter" | "timestamp" | "bytes";
 
 export type InversePlan = {
   actions: Action[];
-  unsupported: number;
 };
 
 const MAKE = /^make(Map|List|Text|Table)$/;
@@ -315,7 +344,8 @@ export function planInverse(
     return ctx.ignore(r.op.key !== undefined ? [...path, r.op.key] : path);
   };
 
-  let unsupported = 0;
+  // Changes that set or removed formats, with the expand of each format.
+  const formatted = new Map<string, Map<string, Format["expand"]>>();
   const inserted = new Map<string, OpRecord>();
   const deleted: OpRecord[] = [];
   // First and last op per map key or overwritten list element.
@@ -327,10 +357,21 @@ export function planInverse(
     // Anything inside an object the step created goes with that object.
     if (created.has(op.obj)) continue;
     if (ignored(r)) continue;
-    if (op.action === "markBegin" || op.action === "markEnd") {
-      unsupported++;
+    if (op.action === "markBegin") {
+      // A mark is a markBegin and its markEnd, next to each other; their
+      // expand flags say whether the format grows at either end.
+      const end = ops[ops.indexOf(r) + 1]?.op;
+      const before = !!(op as { expand?: boolean }).expand;
+      const after = !!(end as { expand?: boolean } | undefined)?.expand;
+      let names = formatted.get(r.hash);
+      if (!names) formatted.set(r.hash, (names = new Map()));
+      names.set(
+        (op as { name?: string }).name!,
+        before && after ? "both" : before ? "before" : after ? "after" : "none"
+      );
       continue;
     }
+    if (op.action === "markEnd") continue;
     if (op.insert) {
       inserted.set(r.id, r);
       continue;
@@ -409,7 +450,10 @@ export function planInverse(
       const copyTarget = `${r.op.obj}\0${restored}`;
       const later = keyed.get(copyTarget);
       keyed.delete(copyTarget);
-      if (first === r && !later) continue;
+      // Unchanged unless the value is an object: edits inside the copy
+      // (made within the step) don't show in its identity, so it gets the
+      // object as it was before the step.
+      if (first === r && !later && value.kind !== "object") continue;
       actions.push({
         kind: "restore",
         order: (later?.last ?? r).order,
@@ -490,7 +534,49 @@ export function planInverse(
   // heads: it precedes the other iff its position is <= the other's index.
   const reinserts = actions.filter((a): a is Reinsert => a.kind === "reinsert");
   const byObj = new Map<string, Reinsert[]>();
+  // The formats a re-inserted character comes back with: those it had
+  // before the step. Where the step formatted its text before deleting it,
+  // that means looking it up where the step began; otherwise the formats
+  // where it was deleted are the same, and cheaper to read.
+  const formatsAt = new Map<string, A.Mark[]>();
+  const marksAt = (obj: string, heads: Heads) => {
+    const key = `${obj}|${heads.join(",")}`;
+    let marks = formatsAt.get(key);
+    if (!marks) formatsAt.set(key, (marks = be.marks(obj, heads)));
+    return marks;
+  };
+  const stepStart = ops[0]?.deps;
+  const formattedBefore = (r: Reinsert) =>
+    ops.some(
+      (o) =>
+        o.order < r.order && o.op.action === "markBegin" && o.op.obj === r.obj
+    );
   for (const r of reinserts) {
+    if (r.type === "text") {
+      let heads = r.heads;
+      let index = r.index;
+      if (stepStart && formattedBefore(r)) {
+        // The element, or, if it is a copy made within the step, the
+        // nearest of its originals that was there when the step began.
+        for (const id of [r.elem, ...ctx.copies.originals(r.elem)]) {
+          if ((ctx.owners.get(id) ?? r.obj) !== r.obj) continue;
+          const created = ctx.created.get(id);
+          if (created !== undefined && created >= (ops[0]?.seq ?? 0)) continue;
+          try {
+            index = be.getCursorPosition(r.obj, id as A.Cursor, stepStart);
+            heads = stepStart;
+            break;
+          } catch {
+            // Not there when the step began.
+          }
+        }
+      }
+      r.formats = Object.fromEntries(
+        marksAt(r.obj, heads)
+          .filter((m) => m.start <= index && m.end > index)
+          .map((m) => [m.name, m.value])
+      );
+    }
     let list = byObj.get(r.obj);
     if (!list) byObj.set(r.obj, (list = []));
     if (r.type === "list") r.position = tombstoneAt(be, r, now);
@@ -501,6 +587,18 @@ export function planInverse(
   const memo = new Map<string, number>();
   for (const list of byObj.values()) {
     list.sort((a, b) => (precedes(be, a, b, memo) ? -1 : 1));
+    // The element each one followed, looked up once per contiguous run.
+    list.forEach((r, i) => {
+      const previous = list[i - 1];
+      if (previous && previous.seq === r.seq && previous.index === r.index - 1)
+        return;
+      if (r.index === 0) return;
+      r.before =
+        r.type === "text"
+          ? be.getCursor(r.obj, r.index - 1, r.heads)
+          : idOf((be.getAll(r.obj, r.index - 1, r.heads) as Entry[]).at(-1)!);
+      if (!ctx.owners.has(r.before)) ctx.owners.set(r.before, r.obj);
+    });
   }
 
   const restores = actions
@@ -510,6 +608,9 @@ export function planInverse(
     .filter((a) => a.kind === "remove")
     .sort((a, b) => b.order - a.order);
   const increments = actions.filter((a) => a.kind === "increment");
+  const formats = planFormats(be, ops, formatted, created, ctx).sort(
+    (a, b) => b.order - a.order
+  );
   return {
     // Removals first: they find their elements by id, and once they are
     // gone, the copies they were won't stand between a tombstone and its
@@ -519,8 +620,9 @@ export function planInverse(
       ...removes,
       ...[...byObj.values()].flat(),
       ...increments,
+      // Last: they find their ranges by elements the others may restore.
+      ...formats,
     ],
-    unsupported,
   };
 }
 
@@ -641,6 +743,14 @@ function copyObject(
   if (type === "text") {
     const text = be.text(src, heads);
     if (text.length > 0) be.splice(dst, 0, 0, text);
+    for (const m of be.marks(src, heads)) {
+      be.mark(
+        dst,
+        { start: m.start, end: m.end, expand: "none" },
+        m.name,
+        m.value
+      );
+    }
     for (let i = 0; i < text.length; i++) {
       const from = (be.getAll(src, i, heads) as Entry[]).at(-1);
       const id = lastId(be, dst, i);
@@ -800,6 +910,8 @@ export function executeInverse(
   const removed = new Map<string, number[]>();
   // The elements the reinsertions of this inverse created.
   const ownCopies = new Set<string>();
+  // Characters re-inserted, with the formats they had.
+  const restoredText: RestoredChar[] = [];
 
   const reachable = (obj: string) => pathOf(be, obj) !== undefined;
   const find = (obj: string, home: string, ids: readonly string[]) => {
@@ -864,6 +976,10 @@ export function executeInverse(
         write(be, target, prop, false, action.value, action.ids, ctx);
         return true;
       }
+      case "format": {
+        format(be, action, target, ctx, conflict, skipped, ownCopies);
+        return true;
+      }
       case "reinsert": {
         for (const id of action.ids) {
           if (!ctx.owners.has(id)) ctx.owners.set(id, action.obj);
@@ -882,6 +998,14 @@ export function executeInverse(
         reinserted.set(target, (reinserted.get(target) ?? 0) + 1);
         lastReinserted.set(action.obj, ctx.copies.follow(action.elem));
         ownCopies.add(ctx.copies.follow(action.elem));
+        if (action.formats) {
+          restoredText.push({
+            target,
+            home: action.obj,
+            copy: ctx.copies.follow(action.elem),
+            formats: action.formats,
+          });
+        }
         return true;
       }
     }
@@ -909,22 +1033,27 @@ export function executeInverse(
 
   // Restores repeat in rounds while one makes another's target reachable
   // (a restored record, then the text inside it).
-  let pending = ordered;
-  for (;;) {
-    const next = pending.filter((action) => !attempt(action));
-    if (next.length === pending.length || next.length === 0) {
+  const rounds = (actions: Action[]) => {
+    let pending = actions;
+    for (;;) {
+      const next = pending.filter((action) => !attempt(action));
+      if (next.length === pending.length || next.length === 0) return next;
       pending = next;
-      break;
     }
-    pending = next;
-  }
+  };
+  const pending = rounds(ordered.filter((a) => a.kind !== "format"));
+  // Re-inserted characters are new elements: they get the formats the
+  // deleted ones had, before the step's own formatting is undone (which
+  // checks the formatting is still the step's).
+  restoreFormats(be, restoredText, ctx);
+  pending.push(...rounds(ordered.filter((a) => a.kind === "format")));
   for (const action of pending) {
     skipped.push({
       path: pathOf(be, action.obj, undefined) ?? [],
       reason: "unreachable",
     });
   }
-  return { skipped, unsupported: plan.unsupported };
+  return { skipped };
 }
 
 function reinsertPosition(
@@ -940,20 +1069,21 @@ function reinsertPosition(
   // The object was itself copied since: the tombstone isn't in the copy, so
   // insert after the nearest earlier element (at the deletion's heads) that
   // has a visible copy.
+  // Copies this inverse re-inserted into the object already precede it
+  // (they go in document order), wherever an index insert put them.
+  const previous = lastReinserted.get(r.obj);
+  const floor = previous
+    ? indexOf(
+        be,
+        target,
+        typeOf(be, target),
+        expand(ctx, [previous]),
+        undefined,
+        ctx.owners
+      ) + 1
+    : 0;
   if (target !== r.obj) {
     const type = typeOf(be, target);
-    // Copies this inverse re-inserted already precede it (document order).
-    const previous = lastReinserted.get(r.obj);
-    const floor = previous
-      ? indexOf(
-          be,
-          target,
-          type,
-          expand(ctx, [previous]),
-          undefined,
-          ctx.owners
-        ) + 1
-      : 0;
     for (let i = r.index - 1; i >= 0; i--) {
       const ids = (be.getAll(r.obj, i, r.heads) as Entry[]).map(idOf);
       const at = indexOf(
@@ -1014,7 +1144,37 @@ function reinsertPosition(
     if (!after) break;
     position--;
   }
-  return position;
+  // An index insert can also land after tombstones it should precede (a
+  // copy placed past them, formatting elements in the way): it goes after
+  // the element it followed when it was deleted, wherever that is now.
+  // If that element is gone too, the nearest earlier one (at the deletion's
+  // heads) that is still there decides; each step back is a lookup at old
+  // heads, so only a few are tried.
+  let after = floor;
+  if (r.before) {
+    const type = typeOf(be, target);
+    const locate = (id: string) =>
+      indexOf(
+        be,
+        target,
+        type,
+        expand(ctx, ctx.copies.chain(id).reverse()),
+        undefined,
+        ctx.owners,
+        r.obj
+      );
+    let at = locate(r.before);
+    for (let i = r.index - 2; at < 0 && i >= Math.max(0, r.index - 32); i--) {
+      const id =
+        r.type === "text"
+          ? be.getCursor(r.obj, i, r.heads)
+          : idOf((be.getAll(r.obj, i, r.heads) as Entry[]).at(-1)!);
+      if (!ctx.owners.has(id)) ctx.owners.set(id, r.obj);
+      at = locate(id);
+    }
+    if (at >= 0) after = Math.max(after, at + 1);
+  }
+  return Math.max(position, after);
 }
 
 /** Where element `id` of `r.obj` was at the heads `r` was deleted at. */
@@ -1044,5 +1204,296 @@ function positionAt(
     // A deleted element with nothing visible after it throws once the
     // document has changed since: it is at the end.
     return be.length(r.obj, r.heads);
+  }
+}
+
+/**
+ * The formats the step set or removed, from its changes' `mark` patches,
+ * each split into segments by the value it had before the change.
+ */
+function planFormats(
+  be: Backend,
+  ops: readonly OpRecord[],
+  formatted: Map<string, Map<string, Format["expand"]>>,
+  created: Set<string>,
+  ctx: InverseContext
+): Format[] {
+  const out: Format[] = [];
+  for (const [hash, expands] of formatted) {
+    const record = ops.find((r) => r.hash === hash)!;
+    const { deps } = record;
+    const patches = be.diff(deps, [hash]);
+    // A change's patches apply one after another, each in the coordinates
+    // the earlier ones left: map a formatting patch's range back to the
+    // text before the change through the splices before it. Characters the
+    // change inserted drop out: the inverse removes them anyway.
+    const isText = (path: Prop[]) => {
+      const o = objectAt(be, path, [hash]);
+      return !!o && typeOf(be, o, [hash]) === "text";
+    };
+    // The formats as the change's earlier marks left them, in the
+    // coordinates before the change: a later mark over the same range
+    // undoes to that, not to the formats before the whole change.
+    const simulated = new Map<
+      string,
+      Array<{ start: number; end: number; value: unknown }>
+    >();
+    const spansOf = (obj: string, name: string) => {
+      const key = `${obj}|${name}`;
+      let spans = simulated.get(key);
+      if (!spans) {
+        spans = be
+          .marks(obj, deps)
+          .filter((m) => m.name === name)
+          .map(({ start, end, value }) => ({ start, end, value }));
+        simulated.set(key, spans);
+      }
+      return spans;
+    };
+    for (const [i, patch] of patches.entries()) {
+      if (patch.action !== "mark") continue;
+      if (ctx.ignore(patch.path)) continue;
+      const obj = objectAt(be, patch.path, [hash]);
+      if (!obj || created.has(obj)) continue;
+      const splices = textSplices(patches.slice(0, i), isText);
+      const key = pathKey(patch.path);
+      for (const mark of patch.marks) {
+        const expand = expands.get(mark.name);
+        if (!expand || mark.end <= mark.start) continue;
+        const range = mapCharsBack(mark.start, mark.end, splices, key);
+        if (!range) continue;
+        const [from, to] = range;
+        // Split [from, to) where the format's value changed before.
+        const all = spansOf(obj, mark.name);
+        const spans = all.filter((m) => m.end > from && m.start < to);
+        const points = [
+          ...new Set([
+            from,
+            to,
+            ...spans
+              .flatMap((m) => [m.start, m.end])
+              .filter((p) => p > from && p < to),
+          ]),
+        ].sort((a, b) => a - b);
+        const segments: Format["segments"] = [];
+        for (let i = 0; i + 1 < points.length; i++) {
+          const a = points[i]!;
+          const b = points[i + 1]!;
+          const prev =
+            spans.find((m) => m.start <= a && m.end > a)?.value ?? null;
+          const last = segments.at(-1);
+          const firstId = be.getCursor(obj, a, deps);
+          const lastId = be.getCursor(obj, b - 1, deps);
+          if (last && stableJSON(last.prev) === stableJSON(prev)) {
+            last.last = lastId;
+            last.to = b;
+          } else {
+            segments.push({
+              first: firstId,
+              last: lastId,
+              prev,
+              from: a,
+              to: b,
+              heads: deps,
+            });
+          }
+        }
+        for (const id of segments.flatMap((g) => [g.first, g.last])) {
+          if (!ctx.owners.has(id)) ctx.owners.set(id, obj);
+        }
+        // Apply the mark to the simulation.
+        const kept = all.flatMap((m) => {
+          if (m.end <= from || m.start >= to) return [m];
+          const parts = [];
+          if (m.start < from) parts.push({ ...m, end: from });
+          if (m.end > to) parts.push({ ...m, start: to });
+          return parts;
+        });
+        if (mark.value !== null && mark.value !== undefined) {
+          kept.push({ start: from, end: to, value: mark.value });
+        }
+        all.splice(0, all.length, ...kept);
+        out.push({
+          kind: "format",
+          order: record.order + out.length / 1e6,
+          obj,
+          name: mark.name,
+          value: mark.value ?? null,
+          expand,
+          segments,
+        });
+      }
+    }
+  }
+  return out;
+}
+
+/** Restore a format's earlier values, segment by segment. */
+function format(
+  be: Backend,
+  action: Format,
+  target: string,
+  ctx: InverseContext,
+  conflict: ConflictPolicy,
+  skipped: Skipped[],
+  ownCopies: ReadonlySet<string>
+): void {
+  const path = pathOf(be, target) ?? [];
+  // Where an element of a segment is now: its own (or newest copy's)
+  // index, or -1 if gone.
+  const find = (id: string): number => {
+    const ids = ctx.copies.chain(id).reverse();
+    return indexOf(be, target, "text", ids, undefined, ctx.owners, action.obj);
+  };
+  // Where an end of a segment is now: its element, or, if that is gone, the
+  // nearest element inward (at the segment's heads) that is still there; a
+  // few are tried, each a lookup at old heads.
+  type Segment = Format["segments"][number];
+  const locate = (segment: Segment, edge: "start" | "end"): number => {
+    const own = find(edge === "start" ? segment.first : segment.last);
+    if (own >= 0) return edge === "start" ? own : own + 1;
+    const span = segment.to - segment.from;
+    for (let k = 1; k < Math.min(span, 32); k++) {
+      const i = edge === "start" ? segment.from + k : segment.to - 1 - k;
+      const id = be.getCursor(action.obj, i, segment.heads);
+      if (!ctx.owners.has(id)) ctx.owners.set(id, action.obj);
+      const at = find(id);
+      if (at >= 0) return edge === "start" ? at : at + 1;
+    }
+    return -1;
+  };
+  for (const segment of action.segments) {
+    const start = locate(segment, "start");
+    const end = locate(segment, "end");
+    // Nothing left between the ends to format.
+    if (start < 0 || end <= start) continue;
+    // Characters this inverse re-inserted have their own formats back
+    // already, and the step never formatted them: leave them out.
+    const pieces: Array<[number, number]> = [];
+    for (let i = start; i < end; i++) {
+      const id = idOf((be.getAll(target, i) as Entry[]).at(-1)!);
+      if (ownCopies.has(id)) continue;
+      const piece = pieces.at(-1);
+      if (piece && piece[1] === i) piece[1] = i + 1;
+      else pieces.push([i, i + 1]);
+    }
+    // Someone else formatted the range since: a conflict, like a value.
+    const spans = be.marks(target).filter((m) => m.name === action.name);
+    const unchanged = pieces.every(([from, to]) => {
+      const current = spans.filter((m) => m.end > from && m.start < to);
+      if (action.value === null) return current.length === 0;
+      return (
+        current.every(
+          (m) => stableJSON(m.value) === stableJSON(action.value)
+        ) && coversWithoutGaps(current, from, to)
+      );
+    });
+    if (!unchanged && conflict === "skip") {
+      skipped.push({ path, reason: "conflict" });
+      continue;
+    }
+    for (const [from, to] of pieces) {
+      const range = { start: from, end: to, expand: action.expand };
+      if (segment.prev === null) be.unmark(target, range, action.name);
+      else be.mark(target, range, action.name, segment.prev as A.ScalarValue);
+    }
+  }
+}
+
+function coversWithoutGaps(
+  spans: ReadonlyArray<{ start: number; end: number }>,
+  start: number,
+  end: number
+): boolean {
+  let reached = start;
+  for (const span of [...spans].sort((a, b) => a.start - b.start)) {
+    if (span.start > reached) return false;
+    reached = Math.max(reached, span.end);
+  }
+  return reached >= end;
+}
+
+type RestoredChar = {
+  target: string;
+  home: string;
+  copy: string;
+  formats: Record<string, unknown>;
+};
+
+/**
+ * Give re-inserted characters the formats the deleted ones had: per text
+ * and format, one mark (or unmark) per run of adjacent characters missing
+ * the same value.
+ */
+function restoreFormats(
+  be: Backend,
+  chars: readonly RestoredChar[],
+  ctx: InverseContext
+): void {
+  const byTarget = new Map<string, Array<RestoredChar & { at: number }>>();
+  for (const c of chars) {
+    const at = indexOf(
+      be,
+      c.target,
+      "text",
+      [c.copy],
+      undefined,
+      ctx.owners,
+      c.target
+    );
+    if (at < 0) continue;
+    let list = byTarget.get(c.target);
+    if (!list) byTarget.set(c.target, (list = []));
+    list.push({ ...c, at });
+  }
+  for (const [target, list] of byTarget) {
+    list.sort((a, b) => a.at - b.at);
+    // The text's formats, read once (a read per character costs a lot
+    // inside a change); writing one format doesn't change another's.
+    const spans = be.marks(target);
+    const lo = list[0]!.at;
+    const hi = list.at(-1)!.at + 1;
+    const names = new Set<string>();
+    for (const c of list)
+      for (const name of Object.keys(c.formats)) names.add(name);
+    for (const m of spans) if (m.end > lo && m.start < hi) names.add(m.name);
+    for (const name of names) {
+      const ofName = spans.filter(
+        (m) => m.name === name && m.end > lo && m.start < hi
+      );
+      const has = (at: number) =>
+        ofName.find((m) => m.start <= at && m.end > at)?.value ?? null;
+      let run: { start: number; end: number; want: unknown } | undefined;
+      const flush = () => {
+        if (!run) return;
+        const range = {
+          start: run.start,
+          end: run.end,
+          expand: "none" as const,
+        };
+        if (run.want === null) be.unmark(target, range, name);
+        else be.mark(target, range, name, run.want as A.ScalarValue);
+        run = undefined;
+      };
+      for (const c of list) {
+        const want = c.formats[name] ?? null;
+        const have = has(c.at);
+        if (stableJSON(want) === stableJSON(have)) {
+          flush();
+          continue;
+        }
+        if (
+          run &&
+          run.end === c.at &&
+          stableJSON(run.want) === stableJSON(want)
+        ) {
+          run.end = c.at + 1;
+        } else {
+          flush();
+          run = { start: c.at, end: c.at + 1, want };
+        }
+      }
+      flush();
+    }
   }
 }

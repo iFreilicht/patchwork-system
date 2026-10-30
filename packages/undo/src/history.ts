@@ -57,8 +57,6 @@ export type UndoResult = {
   patches: Patch[];
   /** Values left alone because someone else changed them, or gone. */
   skipped: Skipped[];
-  /** Ops the inverse can't undo (rich-text marks). */
-  unsupported: number;
 };
 
 export type AppliedEvent = UndoResult & { direction: "undo" | "redo" };
@@ -90,7 +88,6 @@ const NOTHING: UndoResult = {
   applied: false,
   patches: [],
   skipped: [],
-  unsupported: 0,
 };
 
 /**
@@ -331,7 +328,7 @@ export class UndoHistory implements UndoControls {
     // pending operations as a change of their own (automerge#1607).
     const before = A.getHeads(doc);
     const plan = planInverse(doc, hashes, this.#ctx);
-    let outcome = { skipped: [] as Skipped[], unsupported: plan.unsupported };
+    let outcome = { skipped: [] as Skipped[] };
     const collected: string[] = [];
     this.#applying = collected;
     try {
@@ -363,7 +360,6 @@ export class UndoHistory implements UndoControls {
       ),
       patches,
       skipped: outcome.skipped,
-      unsupported: outcome.unsupported,
       hashes: collected,
     };
   }
@@ -526,6 +522,5 @@ function merge(a: UndoResult, b: UndoResult): UndoResult {
     applied: a.applied || b.applied,
     patches: [...a.patches, ...b.patches],
     skipped: [...a.skipped, ...b.skipped],
-    unsupported: a.unsupported + b.unsupported,
   };
 }

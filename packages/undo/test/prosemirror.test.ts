@@ -28,6 +28,19 @@ afterEach(() => {
 
 const text = (doc: Node) => doc.textBetween(0, doc.content.size, "\n");
 
+/** The text with its formatting: each run of text with its marks' names. */
+const formatted = (doc: Node) => {
+  const out: string[] = [];
+  doc.descendants((node) => {
+    if (node.isBlock && out.length) out.push("\n");
+    if (node.isText) {
+      const names = node.marks.map((m) => m.type.name).sort();
+      out.push(names.length ? `[${names.join(",")}:${node.text}]` : node.text!);
+    }
+  });
+  return out.join("");
+};
+
 /**
  * The same scripted transactions, at the same times, go into a ProseMirror
  * state with `prosemirror-history` and into an editor synced to an
@@ -105,7 +118,7 @@ class Session {
    */
   get text() {
     const spans = A.spans(this.handle.doc() as A.Doc<unknown>, ["text"]);
-    return text(pmDocFromSpans(basicSchemaAdapter, spans));
+    return formatted(pmDocFromSpans(basicSchemaAdapter, spans));
   }
 
   /** A user transaction built the same way on both, `dt` ms after the last. */
@@ -137,7 +150,7 @@ class Session {
 
   compare() {
     const equal = (label: string) =>
-      expect(this.text, label).toBe(text(this.pm.doc));
+      expect(this.text, label).toBe(formatted(this.pm.doc));
     equal("before undo");
     let presses = 0;
     while (this.undo()) equal(`after undo ${++presses}`);
@@ -199,6 +212,24 @@ describe("compared with prosemirror-history", () => {
     // A deletion from inside "onetwo" into "three".
     s.user((st) => st.tr.delete(3, 11), 1000);
     s.type("X", 3, 1000);
+    s.compare();
+  });
+
+  test("bold, then unbold part of it", () => {
+    const s = new Session();
+    s.type("hello world", 1);
+    const bold = (st: EditorState) => st.schema.marks.strong!.create();
+    s.user((st) => st.tr.addMark(1, 12, bold(st)), 1000);
+    s.user((st) => st.tr.removeMark(3, 6, st.schema.marks.strong!), 1000);
+    s.user((st) => st.tr.addMark(7, 12, st.schema.marks.em!.create()), 1000);
+    s.compare();
+  });
+
+  test("typing inside formatted text", () => {
+    const s = new Session();
+    s.type("abc", 1);
+    s.user((st) => st.tr.addMark(1, 4, st.schema.marks.strong!.create()), 1000);
+    s.type("XY", 3, 1000);
     s.compare();
   });
 

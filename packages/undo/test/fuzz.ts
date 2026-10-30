@@ -47,7 +47,7 @@ const word = (r: Rng) =>
 /** One random edit of `user`'s section. */
 function edit(r: Rng, user: User, d: Doc): void {
   const s = d[user];
-  const kind = r.int(12);
+  const kind = r.int(14);
   switch (kind) {
     case 0:
     case 1: {
@@ -63,6 +63,27 @@ function edit(r: Rng, user: User, d: Doc): void {
         at,
         1 + r.int(Math.min(3, s.text.length - at))
       );
+      return;
+    }
+    case 12:
+    case 13: {
+      // Format a range: bold or italic (growing at the ends, as inclusive
+      // marks do) or a link, set or removed.
+      if (s.text.length === 0) return edit(r, user, d);
+      const start = r.int(s.text.length);
+      const end = start + 1 + r.int(s.text.length - start);
+      const name = r.pick(["bold", "italic", "link"]);
+      const expand = name === "link" ? "none" : "both";
+      const range = { start, end, expand } as const;
+      if (r.next() < 0.3) A.unmark(d, [user, "text"], range, name);
+      else
+        A.mark(
+          d,
+          [user, "text"],
+          range,
+          name,
+          name === "link" ? `u${r.int(3)}` : true
+        );
       return;
     }
     case 3: {
@@ -222,7 +243,9 @@ function runPeers(
   log?: string[]
 ) {
   const users: Record<User, Peer<Doc>> = { alice, bob };
-  const section = (p: Peer<Doc>, user: User) => stableJSON(p.doc()[user]);
+  // A section with its text's formatting, which its JSON doesn't show.
+  const section = (p: Peer<Doc>, user: User) =>
+    stableJSON({ ...p.doc()[user], marks: A.marks(p.doc(), [user, "text"]) });
   const oracles: Record<User, Oracle> = {
     alice: new Oracle(section(alice, "alice")),
     bob: new Oracle(section(bob, "bob")),

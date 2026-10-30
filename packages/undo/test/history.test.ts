@@ -517,14 +517,129 @@ describe("ignored paths", () => {
   });
 });
 
-describe("marks", () => {
-  test("are left alone and counted as unsupported", () => {
-    const p = solo({ t: "hello" });
-    p.change((d) => {
-      A.mark(d, ["t"], { start: 0, end: 5, expand: "none" }, "bold", true);
+describe("formatting", () => {
+  type T = { t: string };
+  const marks = (p: Peer<T>) =>
+    A.marks(p.doc(), ["t"]).map(({ name, value, start, end }) => [
+      name,
+      value,
+      start,
+      end,
+    ]);
+  const step = (p: Peer<T>, fn: (d: T) => void) => {
+    p.clock.advance(1000);
+    p.change(fn);
+  };
+
+  test("a format set is removed, and comes back on redo", () => {
+    const p = solo<T>({ t: "hello world" });
+    step(p, (d) =>
+      A.mark(d, ["t"], { start: 0, end: 5, expand: "both" }, "bold", true)
+    );
+    expect(p.history.undo().applied).toBe(true);
+    expect(marks(p)).toEqual([]);
+    p.history.redo();
+    expect(marks(p)).toEqual([["bold", true, 0, 5]]);
+  });
+
+  test("a format removed comes back", () => {
+    const p = solo<T>({ t: "hello world" });
+    step(p, (d) =>
+      A.mark(d, ["t"], { start: 0, end: 5, expand: "both" }, "bold", true)
+    );
+    step(p, (d) =>
+      A.unmark(d, ["t"], { start: 1, end: 3, expand: "both" }, "bold")
+    );
+    expect(marks(p)).toEqual([
+      ["bold", true, 0, 1],
+      ["bold", true, 3, 5],
+    ]);
+    p.history.undo();
+    expect(marks(p)).toEqual([["bold", true, 0, 5]]);
+  });
+
+  test("only what the step changed: earlier formatting in the range stays", () => {
+    const p = solo<T>({ t: "hello world" });
+    step(p, (d) =>
+      A.mark(d, ["t"], { start: 0, end: 5, expand: "both" }, "bold", true)
+    );
+    step(p, (d) =>
+      A.mark(d, ["t"], { start: 0, end: 11, expand: "both" }, "bold", true)
+    );
+    p.history.undo();
+    expect(marks(p)).toEqual([["bold", true, 0, 5]]);
+  });
+
+  test("a format's value is restored", () => {
+    const p = solo<T>({ t: "a link" });
+    step(p, (d) =>
+      A.mark(
+        d,
+        ["t"],
+        { start: 2, end: 6, expand: "none" },
+        "link",
+        "https://a"
+      )
+    );
+    step(p, (d) =>
+      A.mark(
+        d,
+        ["t"],
+        { start: 2, end: 6, expand: "none" },
+        "link",
+        "https://b"
+      )
+    );
+    p.history.undo();
+    expect(marks(p)).toEqual([["link", "https://a", 2, 6]]);
+  });
+
+  test("formatted text typed in one step just goes", () => {
+    const p = solo<T>({ t: "ab" });
+    step(p, (d) => {
+      A.splice(d, ["t"], 1, 0, "XY");
+      A.mark(d, ["t"], { start: 1, end: 3, expand: "both" }, "bold", true);
     });
-    const result = p.history.undo();
-    expect(result.unsupported).toBe(2);
-    expect(A.marks(p.doc(), ["t"])).toHaveLength(1);
+    p.history.undo();
+    expect(p.doc().t).toBe("ab");
+    expect(marks(p)).toEqual([]);
+  });
+
+  test("formatting someone else changed since is a conflict", () => {
+    const { alice, bob, sync } = peers<T>({ t: "hello world" });
+    step(alice, (d) =>
+      A.mark(d, ["t"], { start: 0, end: 11, expand: "both" }, "bold", true)
+    );
+    sync();
+    step(bob, (d) =>
+      A.unmark(d, ["t"], { start: 0, end: 5, expand: "both" }, "bold")
+    );
+    sync();
+    const result = alice.history.undo();
+    expect(result.skipped).toEqual([{ path: ["t"], reason: "conflict" }]);
+    expect(marks(alice)).toEqual([["bold", true, 5, 11]]);
+    alice.history.redo();
+    alice.history.undo({ conflict: "force" });
+    expect(marks(alice)).toEqual([]);
+  });
+
+  test("an undo run over formatting becomes a step", () => {
+    const p = solo<T>({ t: "hello" });
+    step(p, (d) =>
+      A.mark(d, ["t"], { start: 0, end: 5, expand: "both" }, "bold", true)
+    );
+    step(p, (d) =>
+      A.mark(d, ["t"], { start: 0, end: 5, expand: "both" }, "italic", true)
+    );
+    p.history.undo();
+    p.history.undo();
+    step(p, (d) => A.splice(d, ["t"], 5, 0, "!"));
+    expect(marks(p)).toEqual([]);
+    p.history.undo();
+    p.history.undo();
+    expect(marks(p)).toEqual([
+      ["bold", true, 0, 5],
+      ["italic", true, 0, 5],
+    ]);
   });
 });
