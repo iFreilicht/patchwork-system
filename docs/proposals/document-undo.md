@@ -721,6 +721,11 @@ through normal sync: the provider messages carry document URLs and the
 booleans `canUndo` / `canRedo` and a timestamp of the user's last use, to
 the host page, which already knows the URLs. Histories are not persisted.
 
+Every change records its signer's verifying key as its actor's `author`
+([11](#11-open-issues), Persistence). The key is public, but it stays in
+each document's history for good and links the changes one browser profile
+makes across all documents it edits.
+
 ## 7. How to teach this
 
 _For tool authors, five minutes._
@@ -789,6 +794,11 @@ menu) are in `packages/undo/examples/` and run in the test suite.
 - Host: `core/patchwork/src/index.ts` and `site-kit/html.ts` mount
   `<undo-provider>`; `core/bootloader/src/externals-list.ts` shares the
   package through the import map.
+- Author: `patches/@automerge__automerge-repo@2.6.0-subduction.48.patch`
+  adds `RepoConfig.author`; `core/patchwork/src/repo.ts` and
+  `core/bootloader/src/automerge-protocol-handler.ts` pass the signer's key
+  (`signerIdentity` in `core/bootloader/src/signer.ts`), tested in
+  `core/patchwork/test/author.test.ts`.
 - Tests (`packages/undo/test`):
   - `history.test.ts`: the collaboration scenario below, redo, grouping by
     time and adjacency, text both peers edit, a deletion around a
@@ -987,16 +997,29 @@ while re-creating an equal object produces operations and patches; the visibilit
   and the user sees no effect. This likely has to be resolved by each tool-
   author; we cannot judge which change is user-visible from inside the framework.
 - **Persistence.** Histories live in memory; closing the last tool on a
-  document or reloading starts empty. The steps could be rebuilt from the
-  document's own commits, but every load gets a new actor, so after a
-  reload the user's earlier changes look like a collaborator's. Recognizing
-  them needs a record of which past actors were this user: either the actor
-  IDs this browser used, remembered in local storage per document (cheap,
-  but only for this browser), or a stable identity of the user (such as the
-  keyhive signer) in Automerge's `author` field, whose actors the backend can
-  list (`getActorsForAuthor`). Patchwork doesn't set `author` today; [the
-  author icons in the history view are the first two hex characters of each
-  change's actor ID](https://github.com/inkandswitch/patchwork-pkg-base/blob/8548485fb23e4b2b029b6795e81bc94bfa6e896a/history-view/src/history/components/HistoryItem.tsx#L25-L34).
+  document or reloading starts empty. Every load gets a new actor, so the
+  steps have to be rebuilt from the document's commits by author rather
+  than by actor. Every Repo Patchwork builds records its signer's verifying
+  key (`patchwork.signer.verifyingKey`, hex) as the Automerge `author` of
+  its actors, so `getActorsForAuthor(doc, key)` lists the actors this
+  browser profile wrote as. Automerge records the author in an actor's
+  first change only; the Repo sets it on every document before that change.
+  Rebuilding steps from those actors' commits is not implemented. Its
+  limits:
+  - The scope is the browser profile, not the tab: every tab on an origin
+    shares one signer, so a restored history holds what all of them did.
+  - Changes made before Patchwork set `author` have none and can't be
+    restored.
+  - `author` is self-asserted: any peer can write any key. For undo this
+    only lets someone make their own changes undoable by you.
+  - Which user a signer belongs to is not recorded anywhere. Attributing
+    changes to users (such as the history view's [author icons, today the
+    first two hex characters of each change's actor
+    ID](https://github.com/inkandswitch/patchwork-pkg-base/blob/8548485fb23e4b2b029b6795e81bc94bfa6e896a/history-view/src/history/components/HistoryItem.tsx#L25-L34))
+    needs a mapping from signer keys to users, such as a list of keys in
+    each user's contact document. That is a separate proposal; the account
+    document's URL can't serve as the author, since outside keyhive it
+    grants write access to the whole account.
 - **Invisible trailing steps.** A press crossing only invisible steps (e.g.
   redo after the last visible step) reports `applied: false`; `canUndo` /
   `canRedo` can't know in advance without applying the inverse.
