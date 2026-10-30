@@ -941,15 +941,20 @@ list at old heads.
    index is carried between states through `diffPath(obj, from, to)`
    patches. _Once fixed:_ list positions become cursor lookups like text,
    and the index carrying and value-id bookkeeping go away.
-2. **A cursor at historical heads throws** (`cursor … is invalid`) for a
-   deleted element with no visible element after it there, once the
-   document has changed since. The same error is thrown for an element that
-   didn't exist yet at those heads, so the two can't be told apart by the
-   error. _Workaround:_ catch it and use `length(obj, heads)`; elements the
-   realm created are checked against the heads first (the realm's changes
-   form a chain by position ([4.15](#415-restoring-a-history)), so an
-   element exists at the heads of a later own change iff its change's
-   position is lower).
+2. **A cursor at historical heads stops resolving once the document
+   changes.** For an element that is deleted at `heads` and has nothing
+   visible after it there, `getCursorPosition(obj, cursor, heads)` returns
+   the right position (the length at `heads`) until the document gets
+   another change. From then on it throws `cursor … is invalid` for the
+   same `heads`. An element that didn't exist yet at `heads` throws the
+   same error, deliberately, so a caller can't simply treat the error as
+   "at the end". _Workaround:_ the engine first checks elements the realm
+   created against the heads (the realm's changes form a chain by position
+   ([4.15](#415-restoring-a-history)), so an element exists at the heads
+   of a later own change iff its change's position is lower), then catches
+   the error and uses `length(obj, heads)`. _Once fixed_ (a fix exists but
+   is not yet submitted upstream), the error means only "didn't exist yet",
+   and the check against the realm's own elements goes away.
 3. **Reading heads inside `change()` commits** the pending operations as a
    change of their own, which the returned document doesn't show
    (automerge#1607 [9]; sibling automerge#1598 [10]). The same holds for
@@ -957,11 +962,14 @@ list at old heads.
    the heads themselves, is read before `handle.change()`; inside it, only
    reads of the current state (`getAll`, `getCursorPosition` without heads,
    `objInfo`) are used. _Once fixed:_ the plan/execute split can collapse.
-4. **A cursor naming another object's element panics** the wasm module
-   (`assertion failed: obj_range.contains(&pos)`) rather than throwing an
-   error. _Workaround:_ the engine records which sequence every element and
-   copy lives in and only asks a cursor position of the object an element
-   belongs to.
+4. **A cursor naming another object's element panics** in the Rust core
+   (`assertion failed: obj_range.contains(&pos)`), which aborts the wasm
+   module, rather than throwing an error (automerge#1593 [12]; fixed on
+   Automerge's `main`, not yet in a release). _Workaround:_ the engine
+   records which sequence every element and copy lives in and only asks a
+   cursor position of the object an element belongs to. _Once fixed_ in a
+   release, such a lookup throws `cursor … is invalid` and can be caught
+   like the others; the record then only saves the failed lookups.
 5. **Reads at historical heads cost as much as reading the whole object
    there.** On a 10 000-character text, `getCursorPosition` at old heads
    takes about 11 ms and `getAll` about 6 ms, against about 0.01 ms for the
@@ -1111,3 +1119,4 @@ while re-creating an equal object produces operations and patches; the visibilit
 9. Automerge issue #1607. https://github.com/automerge/automerge/issues/1607
 10. Automerge issue #1598. https://github.com/automerge/automerge/issues/1598
 11. Automerge issue #1653. https://github.com/automerge/automerge/issues/1653
+12. Automerge issue #1593. https://github.com/automerge/automerge/issues/1593
